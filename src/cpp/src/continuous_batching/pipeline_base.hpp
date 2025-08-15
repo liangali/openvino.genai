@@ -55,9 +55,6 @@ protected:
     std::vector<size_t> m_history_image_ids;
     size_t m_image_id = 0;
 
-    // CDPruner configuration for VLM
-    std::optional<ov::AnyMap> m_vision_config;
-
     float m_load_time_ms = 0.0f;
     // to access m_load_time_ms
     friend class ContinuousBatchingPipeline;
@@ -78,7 +75,8 @@ public:
      */
     virtual GenerationHandle add_request(uint64_t request_id,
                                          const ov::Tensor& input_ids,
-                                         GenerationConfig sampling_params) = 0;
+                                         GenerationConfig sampling_params,
+                                         std::optional<ov::Tensor> token_type_ids = std::nullopt) = 0;
 
     /**
      * Adds request to running queue based on string input
@@ -113,7 +111,8 @@ public:
     virtual std::vector<EncodedGenerationResult>
     generate(const std::vector<ov::Tensor>& input_ids,
              const std::vector<GenerationConfig>& sampling_params,
-             const StreamerVariant& streamer) = 0;
+             const StreamerVariant& streamer,
+             std::optional<std::vector<ov::Tensor>> token_type_ids = std::nullopt) = 0;
 
     /**
      * Performs monolitic generation based on text prompts
