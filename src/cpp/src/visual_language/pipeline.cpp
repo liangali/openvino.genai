@@ -48,9 +48,6 @@ class VLMPipeline::VLMPipelineImpl : public VLMPipelineBase{
     size_t m_image_id = 0;
     ChatHistory m_history;
 
-    // CDPruner configuration
-    ov::AnyMap m_cdpruner_config;
-
 public:
     VLMPipelineImpl(
         const std::filesystem::path& models_dir,
@@ -87,6 +84,8 @@ public:
         if (m_is_npu) {
             embedder_device = "CPU";
             utils::KVDesc kv_desc;
+            // disable chunking as at the moment it is not supported for VLMs
+            lm_properties.insert({"NPUW_LLM_PREFILL_HINT", "STATIC"});
             std::tie(compiled_language_model, kv_desc) = utils::compile_decoder_for_npu(language_model, lm_properties, kv_pos);
             m_max_prompt_len = kv_desc.max_prompt_len;
             m_max_kv_cache_size = kv_desc.max_prompt_len + kv_desc.min_response_len;
@@ -116,13 +115,6 @@ public:
 
         m_sampler.set_tokenizer(m_tokenizer);
         m_sampler.set_seed(m_generation_config.rng_seed);
-
-        // Initialize CDPruner configuration with default values
-        m_cdpruner_config = {
-            {"num_visual_tokens", static_cast<size_t>(64)},
-            {"relevance_weight", 0.5f},
-            {"enable_pruning", true}
-        };
     }
 
 
@@ -158,13 +150,6 @@ public:
 
         m_sampler.set_tokenizer(m_tokenizer);
         m_sampler.set_seed(m_generation_config.rng_seed);
-
-        // Initialize CDPruner configuration with default values
-        m_cdpruner_config = {
-            {"num_visual_tokens", static_cast<size_t>(64)},
-            {"relevance_weight", 0.5f},
-            {"enable_pruning", true}
-        };
     }
 
     VLMDecodedResults generate(
@@ -173,6 +158,7 @@ public:
         GenerationConfig generation_config,
         const StreamerVariant& streamer
     ) override {
+
         auto generate_start_time = std::chrono::steady_clock::now();
         VLMPerfMetrics perf_metrics;
         auto& raw_counters = perf_metrics.raw_metrics;
@@ -200,12 +186,17 @@ public:
                 "Currently only \"num_return_sequences\" equal to 1 is supported for NPU device!");
         }
 
-        // Create config map that includes CDPruner configuration
-        ov::AnyMap vision_config = m_cdpruner_config;
+        ov::AnyMap vision_config;
         
         // Add text prompt to vision config for CDPruner
         vision_config["text_prompt"] = prompt;
-        
+
+        // Set visual token pruning configuration
+        m_inputs_embedder->set_visual_token_pruning_config(generation_config.viusal_tokens_retain_percentage,
+                                                           generation_config.relevance_weight,
+                                                           generation_config.enable_pruning,
+                                                           generation_config.pruning_debug_mode);
+
         const auto encoded_images = m_inputs_embedder->encode_images(rgbs, vision_config);
         auto [unified_prompt, image_sequence] = m_inputs_embedder->normalize_prompt(prompt, m_image_id, encoded_images);
 
@@ -220,9 +211,15 @@ public:
         else {
             m_inputs_embedder->set_apply_chat_template_status(generation_config.apply_chat_template);
         }
+        ov::Tensor inputs_embeds;
+        std::optional<ov::Tensor> token_type_ids;
 
         auto start_get_inputs_embeds = std::chrono::steady_clock::now();
-        ov::Tensor inputs_embeds = m_inputs_embedder->get_inputs_embeds(unified_prompt, encoded_images, perf_metrics, encoded_images.size() > 0, image_sequence);
+        if (m_inputs_embedder->has_token_type_ids()) {
+            std::tie(inputs_embeds, token_type_ids) = m_inputs_embedder->get_inputs_embeds_with_token_type_ids(unified_prompt, encoded_images, perf_metrics, encoded_images.size() > 0, image_sequence);
+        } else {
+            inputs_embeds = m_inputs_embedder->get_inputs_embeds(unified_prompt, encoded_images, perf_metrics, encoded_images.size() > 0, image_sequence);
+        }
         auto end_get_inputs_embeds = std::chrono::steady_clock::now();
 
         if (m_is_npu) {
@@ -271,7 +268,7 @@ public:
         }
 
         ov::genai::utils::GenerationFinishInfo finish_info = ov::genai::get_lm_encoded_results(m_language, inputs_embeds, new_atten_mask, streamer_ptr, m_sampler, requests,
-                                                                                               position_ids, kv_cache_state, m_embedding, rope_delta, m_max_kv_cache_size);
+                                                                                               position_ids, token_type_ids, kv_cache_state, m_embedding, rope_delta, m_max_kv_cache_size);
         EncodedResults& encoded_result = finish_info.results;
 
         auto decode_start_time = std::chrono::steady_clock::now();
@@ -369,44 +366,15 @@ public:
 
         m_generation_config.validate();
     }
-
-    void set_visual_token_pruning_config(
-        size_t num_visual_tokens,
-        float relevance_weight,
-        bool enable_pruning
-    ) override {
-        // Validate input parameters
-        OPENVINO_ASSERT(num_visual_tokens > 0 && num_visual_tokens <= 1024,
-            "num_visual_tokens must be between 1 and 1024, got: ", num_visual_tokens);
-        OPENVINO_ASSERT(relevance_weight >= 0.0f && relevance_weight <= 1.0f,
-            "relevance_weight must be between 0.0 and 1.0, got: ", relevance_weight);
-
-        // Update configuration
-        m_cdpruner_config["num_visual_tokens"] = num_visual_tokens;
-        m_cdpruner_config["relevance_weight"] = relevance_weight;
-        m_cdpruner_config["enable_pruning"] = enable_pruning;
-    }
-
-    ov::AnyMap get_visual_token_pruning_config() const override {
-        return m_cdpruner_config;
-    }
-
-    void set_visual_token_pruning_enabled(bool enable) override {
-        m_cdpruner_config["enable_pruning"] = enable;
-    }
-
-    bool is_visual_token_pruning_enabled() const override {
-        auto it = m_cdpruner_config.find("enable_pruning");
-        if (it != m_cdpruner_config.end()) {
-            try {
-                return it->second.as<bool>();
-            } catch (const std::exception&) {
-                return true; // default value
-            }
-        }
-        return true; // default value
-    }
 };
+
+// TODO: remove it when QWEN ticket-167316/GEMMA3 ticket-171180 is fixed
+bool requires_sdpa(const std::filesystem::path& models_dir) {
+    auto vlm_config = utils::from_config_json_if_exists<VLMConfig>(models_dir, "config.json");
+    return vlm_config.model_type == VLMModelType::QWEN2_VL || 
+           vlm_config.model_type == VLMModelType::QWEN2_5_VL ||
+           vlm_config.model_type == VLMModelType::GEMMA3;
+}
 
 VLMPipeline::VLMPipeline(
     const std::filesystem::path& models_dir,
@@ -422,10 +390,10 @@ VLMPipeline::VLMPipeline(
         m_pimpl = std::make_unique<VLMPipelineImpl>(models_dir, device, properties);
     } else {
         // If CB is invoked explicitly, create CB adapter as is and re-throw in case if internal issues
-        if (utils::explicitly_requires_paged_attention(properties)) {
+        if (utils::explicitly_requires_paged_attention(user_properties)) {
             auto [plugin_properties, scheduler_config] = utils::extract_scheduler_config(properties, utils::get_latency_oriented_scheduler_config());
             m_pimpl = std::make_unique<VLMContinuousBatchingAdapter>(models_dir, scheduler_config, device, plugin_properties);
-        } else if (attention_backend == PA_BACKEND) {
+        } else if (attention_backend == PA_BACKEND && !requires_sdpa(models_dir)) {
             // try to call CB adapter one more time, but with safe guard to silent exception
             try {
                 auto [plugin_properties, scheduler_config] = utils::extract_scheduler_config(properties, utils::get_latency_oriented_scheduler_config());
@@ -465,10 +433,10 @@ VLMPipeline::VLMPipeline(
         m_pimpl = std::make_unique<VLMPipelineImpl>(models_map, tokenizer, config_dir_path, device, properties, generation_config);
     } else {
         // If CB is invoked explicitly, create CB adapter as is and re-throw in case if internal issues
-        if (utils::explicitly_requires_paged_attention(properties)) {
+        if (utils::explicitly_requires_paged_attention(user_properties)) {
             auto [plugin_properties, scheduler_config] = utils::extract_scheduler_config(properties, utils::get_latency_oriented_scheduler_config());
             m_pimpl = std::make_unique<VLMContinuousBatchingAdapter>(models_map, tokenizer, config_dir_path, scheduler_config, device, plugin_properties, generation_config);
-        } else if (attention_backend == PA_BACKEND) {
+        } else if (attention_backend == PA_BACKEND && !requires_sdpa(config_dir_path)) {
             // try to call CB adapter one more time, but with safe guard to silent exception
             try {
                 auto [plugin_properties, scheduler_config] = utils::extract_scheduler_config(properties, utils::get_latency_oriented_scheduler_config());
@@ -542,24 +510,4 @@ GenerationConfig VLMPipeline::get_generation_config() const {
 
 void VLMPipeline::set_generation_config(const GenerationConfig& new_config) {
     m_pimpl->set_generation_config(new_config);
-}
-
-void VLMPipeline::set_visual_token_pruning_config(
-    size_t num_visual_tokens,
-    float relevance_weight,
-    bool enable_pruning
-) {
-    m_pimpl->set_visual_token_pruning_config(num_visual_tokens, relevance_weight, enable_pruning);
-}
-
-ov::AnyMap VLMPipeline::get_visual_token_pruning_config() const {
-    return m_pimpl->get_visual_token_pruning_config();
-}
-
-void VLMPipeline::set_visual_token_pruning_enabled(bool enable) {
-    m_pimpl->set_visual_token_pruning_enabled(enable);
-}
-
-bool VLMPipeline::is_visual_token_pruning_enabled() const {
-    return m_pimpl->is_visual_token_pruning_enabled();
 }

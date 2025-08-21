@@ -117,6 +117,7 @@ public:
     /// Phi-4-multimodal-instruct: <|image_i|>\n - the index starts with one
     /// Qwen2-VL: <|vision_start|><|image_pad|><|vision_end|>
     /// Qwen2.5-VL: <|vision_start|><|image_pad|><|vision_end|>
+    /// gemma-3-4b-it: <start_of_image>
     /// If the prompt doesn't contain image tags, but images are
     /// provided, the tags are prepended to the prompt.
     /// @param image Image to be prepended to a prompt.
@@ -147,6 +148,7 @@ public:
     /// Phi-4-multimodal-instruct: <|image_i|>\n - the index starts with one
     /// Qwen2-VL: <|vision_start|><|image_pad|><|vision_end|>
     /// Qwen2.5-VL: <|vision_start|><|image_pad|><|vision_end|>
+    /// gemma-3-4b-it: <start_of_image>
     /// If the prompt doesn't contain image tags, but images are
     /// provided, the tags are prepended to the prompt.
     /// @param config_map A config may contain GenerationConfig, values
@@ -178,6 +180,7 @@ public:
     /// Phi-4-multimodal-instruct: <|image_i|>\n - the index starts with one
     /// Qwen2-VL: <|vision_start|><|image_pad|><|vision_end|>
     /// Qwen2.5-VL: <|vision_start|><|image_pad|><|vision_end|>
+    /// gemma-3-4b-it: <start_of_image>
     /// If the prompt doesn't contain image tags, but images are
     /// provided, the tags are prepended to the prompt.
     /// @param ...properties ov::Property instances to be combined into
@@ -224,28 +227,6 @@ public:
     /// @brief Override default values for GenerationConfig
     /// @param new_config A config to override default values with.
     void set_generation_config(const GenerationConfig& new_config);
-
-    /// @brief Set visual token pruning configuration for CDPruner
-    /// @param num_visual_tokens Number of visual tokens to retain after pruning (default: 64)
-    /// @param relevance_weight Weight for balancing relevance vs diversity, range [0.0, 1.0] (default: 0.5)
-    /// @param enable_pruning Whether to enable pruning functionality (default: true)
-    void set_visual_token_pruning_config(
-        size_t num_visual_tokens = 64,
-        float relevance_weight = 0.5f,
-        bool enable_pruning = true
-    );
-
-    /// @brief Get current visual token pruning configuration
-    /// @return A map containing current CDPruner configuration
-    ov::AnyMap get_visual_token_pruning_config() const;
-
-    /// @brief Enable or disable visual token pruning
-    /// @param enable Whether to enable pruning (default: true)
-    void set_visual_token_pruning_enabled(bool enable = true);
-
-    /// @brief Check if visual token pruning is enabled
-    /// @return True if pruning is enabled, false otherwise
-    bool is_visual_token_pruning_enabled() const;
 
 private:
     class VLMPipelineBase;

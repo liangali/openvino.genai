@@ -17,6 +17,7 @@
 #include "visual_language/vlm_config.hpp"
 #include "visual_language/embedding_model.hpp"
 #include "visual_language/vision_encoder.hpp"
+#include "visual_language/cdpruner/cdpruner_config.hpp"
 
 namespace ov::genai {
 struct VLMPerfMetrics;
@@ -39,6 +40,13 @@ public:
 
     ov::Tensor get_inputs_embeds(const std::string& prompt, const std::vector<ov::genai::EncodedImage>& images, ov::genai::VLMPerfMetrics& metrics, bool recalculate_merged_embeddings = true, const std::vector<size_t>& image_sequence = {});
 
+    // compute input embedding and token_type_ids
+    std::pair<ov::Tensor, ov::Tensor> get_inputs_embeds_with_token_type_ids(const std::string& prompt, const std::vector<ov::Tensor>& images, VLMPerfMetrics& metrics, const std::vector<size_t>& image_sequence = {});
+    
+    std::pair<ov::Tensor, ov::Tensor> get_inputs_embeds_with_token_type_ids(const std::string& prompt, const std::vector<EncodedImage>& images, VLMPerfMetrics& metrics, bool recalculate_merged_embeddings = true, const std::vector<size_t>& image_sequence = {});
+
+    bool has_token_type_ids() const;
+    
     std::vector<ov::genai::EncodedImage> encode_images(const std::vector<ov::Tensor>& images);
 
     std::vector<ov::genai::EncodedImage> encode_images(const std::vector<ov::Tensor>& images, const ov::AnyMap& config_map);
@@ -67,6 +75,11 @@ public:
     // finishes chat and clears a chat history 
     void finish_chat();
 
+    // set CDPruner setting
+    virtual void set_visual_token_pruning_config(size_t viusal_tokens_retain_percentage,
+                                                 float relevance_weight,
+                                                 bool enable_pruning,
+                                                 bool pruning_debug_mode = false);
     virtual std::pair<std::string, std::vector<size_t>> normalize_prompt(
         const std::string& prompt,
         size_t base_id,
@@ -98,11 +111,18 @@ private:
         utils::KVCacheState m_kv_cache_state;
         // length of attention_mask/kv cache at the beginning of generation()
         size_t m_prev_hist_length = 0;
+        virtual ~IInputsEmbedder() = default;
 
     public:
         virtual ov::Tensor get_inputs_embeds(const std::string& prompt, const std::vector<ov::genai::EncodedImage>& images, ov::genai::VLMPerfMetrics& metrics, bool recalculate_merged_embeddings = true, const std::vector<size_t>& image_sequence = {}) = 0;
 
         ov::Tensor get_inputs_embeds(const std::string& prompt, const std::vector<ov::Tensor>& images, ov::genai::VLMPerfMetrics& metrics, const std::vector<size_t>& image_sequence);
+
+        std::pair<ov::Tensor, ov::Tensor> get_inputs_embeds_with_token_type_ids(const std::string& prompt, const std::vector<ov::Tensor>& images, ov::genai::VLMPerfMetrics& metrics, const std::vector<size_t>& image_sequence = {});
+
+        virtual std::pair<ov::Tensor, ov::Tensor> get_inputs_embeds_with_token_type_ids(const std::string& prompt, const std::vector<ov::genai::EncodedImage>& images, ov::genai::VLMPerfMetrics& metrics, bool recalculate_merged_embeddings = true, const std::vector<size_t>& image_sequence = {});
+
+        virtual bool has_token_type_ids() const;
 
         virtual std::vector<ov::genai::EncodedImage> encode_images(const std::vector<ov::Tensor>& images);
     
@@ -117,8 +137,24 @@ private:
         Tokenizer get_tokenizer() const {
             return m_tokenizer;
         }
-    
-        utils::KVCacheState& get_kv_cache_state() {
+
+        virtual void set_visual_token_pruning_config(size_t viusal_tokens_retain_percentage,
+                                                     float relevance_weight,
+                                                     bool enable_pruning,
+                                                     bool pruning_debug_mode) {
+            if (!m_vision_encoder)
+                return;
+            auto pruner_config = m_vision_encoder->get_pruning_config();
+            if (pruner_config.has_value()) {
+                pruner_config->viusal_tokens_retain_percentage = viusal_tokens_retain_percentage;
+                pruner_config->relevance_weight = relevance_weight;
+                pruner_config->enable_pruning = enable_pruning;
+                pruner_config->pruning_debug_mode = pruning_debug_mode;
+            }
+            m_vision_encoder->set_pruning_config(pruner_config.value());
+        }
+
+        virtual utils::KVCacheState& get_kv_cache_state() {
             return m_kv_cache_state;
         }
     
@@ -186,6 +222,7 @@ private:
     friend class InputsEmbedderPhi4MM;
     friend class InputsEmbedderQwen2VL;
     friend class InputsEmbedderQwen2_5_VL;
+    friend class InputsEmbedderGemma3;
 };
 
 template <typename Func>

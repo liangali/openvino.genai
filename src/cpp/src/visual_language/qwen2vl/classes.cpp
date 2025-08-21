@@ -7,6 +7,7 @@
 #include "visual_language/embedding_model.hpp"
 
 #include "utils.hpp"
+#include "visual_language/vl_sdpa_transformations.hpp"
 
 namespace ov::genai {
 
@@ -231,6 +232,27 @@ ov::Tensor get_attention_mask(const std::vector<std::array<size_t, 3>>& reordere
     return attention_mask;
 }
 
+ov::Tensor get_cu_seqlens(const std::vector<std::array<size_t, 3>>& reordered_images_grid_thw) {
+    // Calculate cumulative sequence lengths for attention mask
+    std::vector<int32_t> cu_seqlens;
+    cu_seqlens.push_back(0);
+    int32_t cumsum = 0;
+    for (const auto& grid_thw : reordered_images_grid_thw) {
+        size_t slice_len = grid_thw.at(1) * grid_thw.at(2);
+        for (size_t t = 0; t < grid_thw.at(0); ++t) {
+            cumsum += slice_len;
+            cu_seqlens.push_back(cumsum);
+        }
+    }
+
+    ov::Tensor t_cu_seqlens = ov::Tensor(ov::element::i32, {cu_seqlens.size()});
+    auto* ptr = static_cast<int32_t*>(t_cu_seqlens.data());
+    for (size_t n = 0; n < cu_seqlens.size(); n++) {
+        ptr[n] = cu_seqlens[n];
+    }
+    return t_cu_seqlens;
+}
+
 ov::Tensor concatenate_image_embeds(const std::vector<ov::Tensor>& reordered_image_embeds) {
     ov::Tensor concatenated_embeds;
     if (reordered_image_embeds.size() == 1) {
@@ -373,22 +395,21 @@ InputsEmbedderQwen2VL::InputsEmbedderQwen2VL(
     const std::string& device,
     const ov::AnyMap device_config) :
     IInputsEmbedder(vlm_config, model_dir, device, device_config) {
-    auto compiled_model = utils::singleton_core().compile_model(model_dir / "openvino_vision_embeddings_merger_model.xml", device, device_config);
-    ov::genai::utils::print_compiled_model_properties(compiled_model, "VLM vision embeddings merger model");
+    auto model = utils::singleton_core().read_model(model_dir / "openvino_vision_embeddings_merger_model.xml");
+    utils::request_vl_sdpa_transformations(model);
+
+    auto compiled_model = utils::singleton_core().compile_model(model, device, device_config);
+
+    m_with_cu_seqlens_input = utils::check_vl_sdpa_transformations(compiled_model);
+    ov::genai::utils::print_compiled_model_properties(compiled_model,
+        m_with_cu_seqlens_input ? "VLM vision embeddings merger model with VLSDPA optimization ENABLED" :
+        "VLM vision embeddings merger model with VLSDPA optimization DISABLED");
+
     m_ireq_queue_vision_embeddings_merger = std::make_unique<CircularBufferQueue<ov::InferRequest>>(
         compiled_model.get_property(ov::optimal_number_of_infer_requests),
         [&compiled_model]() -> ov::InferRequest {
             return compiled_model.create_infer_request();
         });
-    
-    // [CDPruner] Initialize CDPruner with hardcoded configuration
-    ov::genai::cdpruner::Config cdpruner_config;
-    cdpruner_config.num_visual_tokens = 300;  // Hardcoded 40% retention rate for Qwen2.5-VL
-    cdpruner_config.relevance_weight = 0.5f;  // Balance between relevance and diversity
-    cdpruner_config.enable_pruning = true;    // Enable pruning functionality
-    cdpruner_config.device = device;          // Use same device as the model
-    cdpruner_config.debug_mode = false;       // Disable debug output for production
-    m_cdpruner = std::make_unique<ov::genai::cdpruner::CDPruner>(cdpruner_config);
 }
 
 InputsEmbedderQwen2VL::InputsEmbedderQwen2VL(
@@ -399,27 +420,26 @@ InputsEmbedderQwen2VL::InputsEmbedderQwen2VL(
     const std::string& device,
     const ov::AnyMap device_config) :
     IInputsEmbedder(vlm_config, models_map, tokenizer, config_dir_path, device, device_config) {
-    auto compiled_model = utils::singleton_core().compile_model(
+    auto model = utils::singleton_core().read_model(
         utils::get_model_weights_pair(models_map, "vision_embeddings_merger").first,
-        utils::get_model_weights_pair(models_map, "vision_embeddings_merger").second,
+        utils::get_model_weights_pair(models_map, "vision_embeddings_merger").second);
+    utils::request_vl_sdpa_transformations(model);
+
+    auto compiled_model = utils::singleton_core().compile_model(model,
         device,
         device_config
     );
-    ov::genai::utils::print_compiled_model_properties(compiled_model, "VLM vision embeddings merger model");
+
+    m_with_cu_seqlens_input = utils::check_vl_sdpa_transformations(compiled_model);
+    ov::genai::utils::print_compiled_model_properties(compiled_model,
+        m_with_cu_seqlens_input ? "VLM vision embeddings merger model with VLSDPA optimization ENABLED" :
+        "VLM vision embeddings merger model with VLSDPA optimization DISABLED");
+
     m_ireq_queue_vision_embeddings_merger = std::make_unique<CircularBufferQueue<ov::InferRequest>>(
         compiled_model.get_property(ov::optimal_number_of_infer_requests),
         [&compiled_model]() -> ov::InferRequest {
             return compiled_model.create_infer_request();
         });
-    
-    // [CDPruner] Initialize CDPruner with hardcoded configuration
-    ov::genai::cdpruner::Config cdpruner_config;
-    cdpruner_config.num_visual_tokens = 550;  // Hardcoded 40% retention rate for Qwen2.5-VL (from ~1376 to 550)
-    cdpruner_config.relevance_weight = 0.5f;  // Balance between relevance and diversity
-    cdpruner_config.enable_pruning = true;    // Enable pruning functionality
-    cdpruner_config.device = device;          // Use same device as the model
-    cdpruner_config.debug_mode = false;       // Disable debug output for production
-    m_cdpruner = std::make_unique<ov::genai::cdpruner::CDPruner>(cdpruner_config);
 }
 
 std::pair<std::string, std::vector<size_t>> InputsEmbedderQwen2VL::normalize_prompt(const std::string& prompt, size_t base_id, const std::vector<EncodedImage>& images) const {
@@ -503,10 +523,10 @@ ov::Tensor InputsEmbedderQwen2VL::get_inputs_embeds(const std::string& unified_p
     size_t original_visual_tokens = 0;
     size_t pruned_visual_tokens = 0;
 
-    auto pruner_config = m_cdpruner->get_config();
-    bool pruner_enabled = pruner_config.enable_pruning;
-    
-    if (m_cdpruner && pruner_enabled && !images.empty()) {
+    auto current_config = m_vision_encoder->get_pruning_config();
+    bool pruner_enabled = !current_config.has_value() ? false : current_config->enable_pruning;
+
+    if (m_vision_encoder->is_pruning_available() && pruner_enabled && !images.empty()) {
         // Store original visual token count for position adjustment
         original_visual_tokens = merged_image_embeddings_tensor.get_shape()[0];
         
@@ -518,10 +538,10 @@ ov::Tensor InputsEmbedderQwen2VL::get_inputs_embeds(const std::string& unified_p
         
         // Convert visual features for CDPruner using the implemented function
         ov::Tensor visual_features = convert_visual_features_for_cdpruner(merged_image_embeddings_tensor);
-        
+
         // Apply CDPruner to get pruned visual tokens
-        ov::Tensor pruned_visual_features = m_cdpruner->apply_pruning(visual_features, text_features);
-        
+        ov::Tensor pruned_visual_features = m_vision_encoder->apply_pruning(visual_features, text_features);
+
         // [CDPruner] Convert back from 3D [1, num_tokens, hidden_size] to 2D [num_tokens, hidden_size]
         // to match the expected input format for merge_text_and_image_embeddings
         ov::Shape pruned_shape = pruned_visual_features.get_shape();
@@ -559,9 +579,14 @@ ov::Tensor InputsEmbedderQwen2VL::get_inputs_embeds(const std::string& unified_p
     }
 
     // [CDPruner] Handle pruned visual tokens case
-    if (m_cdpruner && pruner_enabled  && !images.empty() && original_visual_tokens != pruned_visual_tokens) {
+    if (m_vision_encoder->is_pruning_available() && pruner_enabled && !images.empty() &&
+        original_visual_tokens != pruned_visual_tokens) {
         // Visual tokens have been pruned, need to create new merged embeddings with correct dimensions
-        return merge_text_and_image_embeddings_with_pruning(input_ids, text_embeds, merged_image_embeddings_tensor, image_pad_token_id, original_visual_tokens);
+        return merge_text_and_image_embeddings_with_pruning(input_ids,
+                                                            text_embeds,
+                                                            merged_image_embeddings_tensor,
+                                                            image_pad_token_id,
+                                                            original_visual_tokens);
     } else {
         // No pruning or no images, use original function
         return qwen2_vl_utils::merge_text_and_image_embeddings(input_ids, text_embeds, merged_image_embeddings_tensor, image_pad_token_id);
@@ -602,13 +627,18 @@ ov::Tensor InputsEmbedderQwen2VL::run_image_embeddings_merger(
     auto [reordered_image_embeds, reordered_images_grid_thw] = qwen2_vl_utils::reorder_image_embeds_and_grid_thw(images, images_sequence);
 
     ov::Tensor concatenated_embeds = qwen2_vl_utils::concatenate_image_embeds(reordered_image_embeds);
-    ov::Tensor attention_mask = qwen2_vl_utils::get_attention_mask(reordered_images_grid_thw);
     ov::Tensor rotary_pos_emb = get_rotary_pos_emb(reordered_images_grid_thw);
 
     CircularBufferQueueElementGuard<ov::InferRequest> infer_request_guard(this->m_ireq_queue_vision_embeddings_merger.get());
     ov::InferRequest& vision_embeddings_merger = infer_request_guard.get();
     vision_embeddings_merger.set_tensor("hidden_states", concatenated_embeds);
-    vision_embeddings_merger.set_tensor("attention_mask", attention_mask);
+    if (m_with_cu_seqlens_input) {
+        ov::Tensor cu_seq_lens = qwen2_vl_utils::get_cu_seqlens(reordered_images_grid_thw);
+        vision_embeddings_merger.set_tensor("cu_seq_lens", cu_seq_lens);
+    } else {
+        ov::Tensor attention_mask = qwen2_vl_utils::get_attention_mask(reordered_images_grid_thw);
+        vision_embeddings_merger.set_tensor("attention_mask", attention_mask);
+    }
     vision_embeddings_merger.set_tensor("rotary_pos_emb", rotary_pos_emb);
     vision_embeddings_merger.infer();
     ov::Tensor processed_vision_embeds = vision_embeddings_merger.get_output_tensor();
