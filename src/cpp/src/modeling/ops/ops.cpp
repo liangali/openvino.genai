@@ -3,6 +3,7 @@
 
 #include "modeling/ops/ops.hpp"
 
+#include <iostream>
 #include <openvino/core/except.hpp>
 #include <openvino/op/linear_attn.hpp>
 #include <openvino/opsets/opset13.hpp>
@@ -136,9 +137,28 @@ Tensor moe3gemm_fused_compressed(const Tensor& input,
                                  int32_t num_experts,
                                  int32_t top_k,
                                  size_t group_size,
-                                 const ov::element::Type& out_type) {
+                                 const ov::element::Type& out_type,
+                                 const Tensor& shared_gate_weight,
+                                 const Tensor& shared_gate_scales,
+                                 const Tensor& shared_gate_zps,
+                                 const Tensor& shared_up_weight,
+                                 const Tensor& shared_up_scales,
+                                 const Tensor& shared_up_zps,
+                                 const Tensor& shared_down_weight,
+                                 const Tensor& shared_down_scales,
+                                 const Tensor& shared_down_zps,
+                                 const Tensor& shared_gate_gate_weight) {
     auto* ctx = input.context();
     auto router = matmul(input, gate_inp_weight, false, true);
+    // The MOE3GemmFusedCompressed softmax_topk OCL kernel uses
+    // intel_sub_group_block_read_us (reads 2-byte half) to read routing logits.
+    // GPU plugin's automatic f16 conversion only fires when gate_inp_weight is a
+    // plain constant; when it comes from a quantized/dequant subgraph the explicit
+    // Convert(f16->f32) at the end of that subgraph blocks the auto-conversion and
+    // the matmul output stays f32, causing a type mismatch and CL_OUT_OF_RESOURCES.
+    // Explicitly convert to f16 here to match the kernel's expectation regardless
+    // of how gate_inp_weight was constructed.
+    auto router_f16 = router.to(ov::element::f16);
     auto hidden_f16 = input.to(ov::element::f16);
 
     ov::op::internal::MOE3GemmFusedCompressed::Config config;
@@ -151,7 +171,7 @@ Tensor moe3gemm_fused_compressed(const Tensor& input,
 
     ov::OutputVector args = {
         hidden_f16.output(),
-        router.output(),
+        router_f16.output(),
         gate_exps_weight.output(),
         gate_exps_scales.output(),
         gate_exps_zps.output(),
@@ -162,6 +182,21 @@ Tensor moe3gemm_fused_compressed(const Tensor& input,
         down_exps_scales.output(),
         down_exps_zps.output()
     };
+
+    if (shared_gate_weight.context()) {
+        args.push_back(shared_gate_weight.output());
+        args.push_back(shared_gate_scales.output());
+        args.push_back(shared_gate_zps.output());
+        args.push_back(shared_up_weight.output());
+        args.push_back(shared_up_scales.output());
+        args.push_back(shared_up_zps.output());
+        args.push_back(shared_down_weight.output());
+        args.push_back(shared_down_scales.output());
+        args.push_back(shared_down_zps.output());
+        args.push_back(shared_gate_gate_weight.output());
+        config.num_shared_expert = 1;
+    }
+
     auto moe = std::make_shared<ov::op::internal::MOE3GemmFusedCompressed>(args, config);
     auto moe_f32 = std::make_shared<ov::op::v0::Convert>(moe, ov::element::f32);
     return Tensor(moe_f32, ctx);

@@ -184,6 +184,7 @@ Qwen3_5SparseMoeBlock::Qwen3_5SparseMoeBlock(BuilderContext& ctx,
         up_source.add(up_name, up_tensor);
         auto up_result = finalizer.finalize(up_name, up_source, *param.context());
 
+        // Store the independently quantized weights + scales + zps
         gate_weight_ = gate_result.primary;
         gate_scales_ = gate_result.get_auxiliary("scales");
         gate_zps_ = gate_result.get_auxiliary("zps");
@@ -213,6 +214,66 @@ Qwen3_5SparseMoeBlock::Qwen3_5SparseMoeBlock(BuilderContext& ctx,
         if (weight.get_auxiliary("scales") != std::nullopt && weight.get_auxiliary("zps") != std::nullopt) {
             down_scales_ = weight.auxiliary.at("scales");
             down_zps_ = weight.auxiliary.at("zps");
+        }
+    });
+
+    shared_gate_proj_param_->set_weight_loader([this](WeightParameter& param,
+                                                      weights::WeightSource& source,
+                                                      weights::WeightFinalizer& finalizer,
+                                                      const std::string& weight_name,
+                                                      const std::optional<int>& shard_id) {
+        (void)shard_id;
+        if (!param.context()) {
+            OPENVINO_THROW("WeightParameter has no OpContext: ", param.name());
+        }
+        auto weight = finalizer.finalize(weight_name, source, *param.context());
+        param.bind(weight);
+
+        shared_gate_scales_.reset();
+        shared_gate_zps_.reset();
+        if (weight.get_auxiliary("scales") != std::nullopt && weight.get_auxiliary("zps") != std::nullopt) {
+            shared_gate_scales_ = weight.auxiliary.at("scales");
+            shared_gate_zps_ = weight.auxiliary.at("zps");
+        }
+    });
+
+    shared_up_proj_param_->set_weight_loader([this](WeightParameter& param,
+                                                    weights::WeightSource& source,
+                                                    weights::WeightFinalizer& finalizer,
+                                                    const std::string& weight_name,
+                                                    const std::optional<int>& shard_id) {
+        (void)shard_id;
+        if (!param.context()) {
+            OPENVINO_THROW("WeightParameter has no OpContext: ", param.name());
+        }
+        auto weight = finalizer.finalize(weight_name, source, *param.context());
+        param.bind(weight);
+
+        shared_up_scales_.reset();
+        shared_up_zps_.reset();
+        if (weight.get_auxiliary("scales") != std::nullopt && weight.get_auxiliary("zps") != std::nullopt) {
+            shared_up_scales_ = weight.auxiliary.at("scales");
+            shared_up_zps_ = weight.auxiliary.at("zps");
+        }
+    });
+
+    shared_down_proj_param_->set_weight_loader([this](WeightParameter& param,
+                                                      weights::WeightSource& source,
+                                                      weights::WeightFinalizer& finalizer,
+                                                      const std::string& weight_name,
+                                                      const std::optional<int>& shard_id) {
+        (void)shard_id;
+        if (!param.context()) {
+            OPENVINO_THROW("WeightParameter has no OpContext: ", param.name());
+        }
+        auto weight = finalizer.finalize(weight_name, source, *param.context());
+        param.bind(weight);
+
+        shared_down_scales_.reset();
+        shared_down_zps_.reset();
+        if (weight.get_auxiliary("scales") != std::nullopt && weight.get_auxiliary("zps") != std::nullopt) {
+            shared_down_scales_ = weight.auxiliary.at("scales");
+            shared_down_zps_ = weight.auxiliary.at("zps");
         }
     });
 }
@@ -285,12 +346,26 @@ size_t Qwen3_5SparseMoeBlock::infer_group_size() const {
 }
 
 Tensor Qwen3_5SparseMoeBlock::routed_fused(const Tensor& flat_f32) const {
+    // Gate and up weights were quantized independently during weight loading.
+    // Use them directly — no splitting needed.
     OPENVINO_ASSERT(gate_weight_.has_value() && gate_scales_.has_value() && gate_zps_.has_value(),
                     "Gate expert weights not loaded (split-before-quantize)");
     OPENVINO_ASSERT(up_weight_.has_value() && up_scales_.has_value() && up_zps_.has_value(),
                     "Up expert weights not loaded (split-before-quantize)");
     OPENVINO_ASSERT(down_scales_.has_value() && down_zps_.has_value(),
                     "Down expert scales/zps not loaded");
+
+    auto sh_gate_w = shared_gate_proj_weight();
+    auto sh_up_w = shared_up_proj_weight();
+    auto sh_down_w = shared_down_proj_weight();
+    auto sh_gate_gate_w = shared_expert_gate_weight().to(ov::element::f16);
+
+    auto sh_gate_scales = shared_gate_scales_.value();
+    auto sh_gate_zps = shared_gate_zps_.value();
+    auto sh_up_scales = shared_up_scales_.value();
+    auto sh_up_zps = shared_up_zps_.value();
+    auto sh_down_scales = shared_down_scales_.value();
+    auto sh_down_zps = shared_down_zps_.value();
 
     return ops::moe3gemm_fused_compressed(flat_f32,
                                           gate_weight(),
@@ -308,7 +383,17 @@ Tensor Qwen3_5SparseMoeBlock::routed_fused(const Tensor& flat_f32) const {
                                           num_experts_,
                                           top_k_,
                                           infer_group_size(),
-                                          ov::element::f16);
+                                          ov::element::f16,
+                                          sh_gate_w,
+                                          sh_gate_scales,
+                                          sh_gate_zps,
+                                          sh_up_w,
+                                          sh_up_scales,
+                                          sh_up_zps,
+                                          sh_down_w,
+                                          sh_down_scales,
+                                          sh_down_zps,
+                                          sh_gate_gate_w);
 }
 
 Tensor Qwen3_5SparseMoeBlock::routed_fallback(const Tensor& flat_f32) const {
@@ -336,9 +421,9 @@ Tensor Qwen3_5SparseMoeBlock::routed_fallback(const Tensor& flat_f32) const {
     auto zeros = shape::broadcast_to(Tensor(ops::const_scalar(op_ctx, 0.0f), op_ctx), shape::of(scores));
     auto scatter_axis = ops::const_scalar(op_ctx, static_cast<int64_t>(1));
     auto scatter = std::make_shared<ov::op::v12::ScatterElementsUpdate>(zeros.output(),
-                                                                         topk_idx.output(),
-                                                                         topk_vals.output(),
-                                                                         scatter_axis);
+                                                                        topk_idx.output(),
+                                                                        topk_vals.output(),
+                                                                        scatter_axis);
     Tensor routing(scatter, op_ctx);  // [T, E]
     auto perm = ops::const_vec(op_ctx, std::vector<int64_t>{1, 0});
     auto routing_t = Tensor(std::make_shared<ov::op::v1::Transpose>(routing.output(), perm), op_ctx);
@@ -392,7 +477,13 @@ Tensor Qwen3_5SparseMoeBlock::forward(const Tensor& hidden_states) const {
     auto flat = hidden_states.reshape({-1, hidden_size_});
     auto flat_f32 = flat.to(ov::element::f32);
 
-    auto routed_out = can_use_fused_path() ? routed_fused(flat_f32) : routed_fallback(flat_f32);
+    if (can_use_fused_path()) {
+        auto fused_out = routed_fused(flat_f32);
+        auto restored = fused_out.reshape(shape::of(hidden_states), false);
+        return restored.to(input_dtype);
+    }
+
+    auto routed_out = routed_fallback(flat_f32);
 
     auto shared_gate = ops::linear(flat_f32, shared_gate_proj_weight().to(ov::element::f32));
     auto shared_up = ops::linear(flat_f32, shared_up_proj_weight().to(ov::element::f32));

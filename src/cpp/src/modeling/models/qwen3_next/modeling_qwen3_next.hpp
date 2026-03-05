@@ -283,6 +283,13 @@ private:
     std::vector<Tensor> up_exps_zps_;
     std::vector<Tensor> down_exps_scales_;
     std::vector<Tensor> down_exps_zps_;
+
+    std::optional<Tensor> shared_gate_scales_;
+    std::optional<Tensor> shared_gate_zps_;
+    std::optional<Tensor> shared_up_scales_;
+    std::optional<Tensor> shared_up_zps_;
+    std::optional<Tensor> shared_down_scales_;
+    std::optional<Tensor> shared_down_zps_;
 };
 
 class Qwen3NextDecoderLayer : public Module {

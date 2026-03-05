@@ -481,7 +481,7 @@ Tensor Qwen3_5GatedDeltaNet::forward(const Tensor& hidden_states,
     auto k_heads = k_conv.reshape({0, 0, num_k_heads_, head_k_dim_});
     auto v_heads = v_conv.reshape({0, 0, num_v_heads_, head_v_dim_});
 
-    if (ratio > 1 && !use_linear_attention_op()) {
+    if (ratio > 1) {
         q_heads = ops::llm::repeat_kv(q_heads.permute({0, 2, 1, 3}), num_v_heads_, num_k_heads_, head_k_dim_)
                       .permute({0, 2, 1, 3});
         k_heads = ops::llm::repeat_kv(k_heads.permute({0, 2, 1, 3}), num_v_heads_, num_k_heads_, head_k_dim_)
@@ -1020,4 +1020,3 @@ std::shared_ptr<ov::Model> create_qwen3_5_text_model(
 }  // namespace modeling
 }  // namespace genai
 }  // namespace ov
-

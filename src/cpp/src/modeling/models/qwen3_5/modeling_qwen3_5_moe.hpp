@@ -62,6 +62,13 @@ private:
 
     std::optional<Tensor> down_scales_;
     std::optional<Tensor> down_zps_;
+
+    std::optional<Tensor> shared_gate_scales_;
+    std::optional<Tensor> shared_gate_zps_;
+    std::optional<Tensor> shared_up_scales_;
+    std::optional<Tensor> shared_up_zps_;
+    std::optional<Tensor> shared_down_scales_;
+    std::optional<Tensor> shared_down_zps_;
 };
 
 }  // namespace models

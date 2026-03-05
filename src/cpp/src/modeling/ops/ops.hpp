@@ -45,7 +45,17 @@ Tensor moe3gemm_fused_compressed(const Tensor& input,
                                  int32_t num_experts,
                                  int32_t top_k,
                                  size_t group_size,
-                                 const ov::element::Type& out_type);
+                                 const ov::element::Type& out_type,
+                                 const Tensor& shared_gate_weight = Tensor{},
+                                 const Tensor& shared_gate_scales = Tensor{},
+                                 const Tensor& shared_gate_zps = Tensor{},
+                                 const Tensor& shared_up_weight = Tensor{},
+                                 const Tensor& shared_up_scales = Tensor{},
+                                 const Tensor& shared_up_zps = Tensor{},
+                                 const Tensor& shared_down_weight = Tensor{},
+                                 const Tensor& shared_down_scales = Tensor{},
+                                 const Tensor& shared_down_zps = Tensor{},
+                                 const Tensor& shared_gate_gate_weight = Tensor{});
 Tensor silu(const Tensor& x);
 Tensor reduce_mean(const Tensor& x, int64_t axis, bool keepdim = true);
 Tensor gather(const Tensor& data, const Tensor& indices, int64_t axis);
