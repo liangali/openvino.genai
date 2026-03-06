@@ -4,6 +4,7 @@
 #include "gguf_utils/gguf.hpp"
 
 #include <algorithm>
+#include <cfloat>
 #include <cstdint>
 #include <cstring>
 #include <fstream>

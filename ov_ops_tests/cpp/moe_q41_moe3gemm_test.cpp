@@ -12,6 +12,7 @@
 #include <numeric>
 #include <random>
 #include <string>
+#include <cfloat>
 #include <vector>
 #include <cfloat>
 

@@ -783,6 +783,16 @@ bool SafetensorsWeightFinalizer::is_moe_weight(const std::string& name) const {
             return true;
         }
     }
+
+    // Pattern 1c: Qwen3.5-MoE Shared Expert weights
+    // These also need exposed scales/zps for the fused kernel
+    if (name.find(".mlp.shared_expert.") != std::string::npos) {
+        if (name.find("gate_proj.weight") != std::string::npos ||
+            name.find("up_proj.weight") != std::string::npos ||
+            name.find("down_proj.weight") != std::string::npos) {
+            return true;
+        }
+    }
     
     // Pattern 2: Pre-fused weights  
     return name.find("moe.gate_exps") != std::string::npos ||

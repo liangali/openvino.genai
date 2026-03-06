@@ -1200,6 +1200,37 @@ ov::Output<ov::Node> make_inflight_moe(
     auto fused_up_weights = make_int4_weights_for_moe(up_exps_key, consts, false, -1, 128);
     auto fused_down_weights = make_int4_weights_for_moe(down_exps_key, consts, false, -1, 128);
 
+    std::string shared_gate_key = key + ".moe.shared_expert.gate_proj";
+    std::string shared_up_key = key + ".moe.shared_expert.up_proj";
+    std::string shared_down_key = key + ".moe.shared_expert.down_proj";
+    std::string shared_gate_gate_key = key + ".moe.shared_expert_gate";
+
+    int num_shared_expert = 0;
+    std::vector<Output<Node>> shared_inputs;
+    if (consts.count(shared_gate_key + ".weight")) {
+        num_shared_expert = 1;
+        auto shared_gate_w = make_int4_weights_for_moe(shared_gate_key, consts, false, -1, 128);
+        auto shared_up_w = make_int4_weights_for_moe(shared_up_key, consts, false, -1, 128);
+        auto shared_down_w = make_int4_weights_for_moe(shared_down_key, consts, false, -1, 128);
+
+        shared_inputs.push_back(shared_gate_w[0]);
+        shared_inputs.push_back(shared_gate_w[1]);
+        shared_inputs.push_back(shared_gate_w[2]);
+        shared_inputs.push_back(shared_up_w[0]);
+        shared_inputs.push_back(shared_up_w[1]);
+        shared_inputs.push_back(shared_up_w[2]);
+        shared_inputs.push_back(shared_down_w[0]);
+        shared_inputs.push_back(shared_down_w[1]);
+        shared_inputs.push_back(shared_down_w[2]);
+
+        if (consts.count(shared_gate_gate_key + ".weight")) {
+             auto shared_gate_gate_w = make_weights_subgraph(shared_gate_gate_key, consts,
+                qtypes.count(shared_gate_gate_key + ".qtype") ? qtypes.at(shared_gate_gate_key + ".qtype") : gguf_tensor_type::GGUF_TYPE_F16,
+                false, -1);
+             shared_inputs.push_back(shared_gate_gate_w);
+        }
+    }
+
     // Create MOE internal op
     ov::OutputVector moe_inputs = {
         hidden_f16,
@@ -1215,6 +1246,10 @@ ov::Output<ov::Node> make_inflight_moe(
         fused_down_weights[2]
     };
     
+    if (num_shared_expert > 0) {
+        moe_inputs.insert(moe_inputs.end(), shared_inputs.begin(), shared_inputs.end());
+    }
+
     int cfg_num_expert = 0;
     int cfg_top_k = 0;
     int cfg_inter_size = 0;
@@ -1235,6 +1270,7 @@ ov::Output<ov::Node> make_inflight_moe(
     config.top_k = cfg_top_k > 0 ? cfg_top_k : 1;
     config.group_size = 128;
     config.out_type = ov::element::f16;
+    config.num_shared_expert = num_shared_expert;
 
     if (config.inter_size != cfg_inter_size) {
         std::cout << "inter size is not matched!" << std::endl;
@@ -1330,6 +1366,37 @@ ov::Output<ov::Node> make_moe(
         cfg_inter_size = std::get<int>(configs.at("moe_inter_size"));
     }
 
+    std::string shared_gate_key = key + ".moe.shared_expert.gate_proj";
+    std::string shared_up_key = key + ".moe.shared_expert.up_proj";
+    std::string shared_down_key = key + ".moe.shared_expert.down_proj";
+    std::string shared_gate_gate_key = key + ".moe.shared_expert_gate";
+
+    int num_shared_expert = 0;
+    std::vector<Output<Node>> shared_inputs;
+    if (consts.count(shared_gate_key + ".weight")) {
+        num_shared_expert = 1;
+        auto shared_gate_w = make_int4_weights_for_moe(shared_gate_key, consts, false, -1, 128);
+        auto shared_up_w = make_int4_weights_for_moe(shared_up_key, consts, false, -1, 128);
+        auto shared_down_w = make_int4_weights_for_moe(shared_down_key, consts, false, -1, 128);
+
+        shared_inputs.push_back(shared_gate_w[0]);
+        shared_inputs.push_back(shared_gate_w[1]);
+        shared_inputs.push_back(shared_gate_w[2]);
+        shared_inputs.push_back(shared_up_w[0]);
+        shared_inputs.push_back(shared_up_w[1]);
+        shared_inputs.push_back(shared_up_w[2]);
+        shared_inputs.push_back(shared_down_w[0]);
+        shared_inputs.push_back(shared_down_w[1]);
+        shared_inputs.push_back(shared_down_w[2]);
+
+        if (consts.count(shared_gate_gate_key + ".weight")) {
+             auto shared_gate_gate_w = make_weights_subgraph(shared_gate_gate_key, consts,
+                qtypes.count(shared_gate_gate_key + ".qtype") ? qtypes.at(shared_gate_gate_key + ".qtype") : gguf_tensor_type::GGUF_TYPE_F16,
+                false, -1);
+             shared_inputs.push_back(shared_gate_gate_w);
+        }
+    }
+
     ov::op::internal::MOE3GemmFusedCompressed::Config config;
     config.hidden_size = static_cast<int>(hidden_size);
     config.inter_size = cfg_inter_size > 0 ? cfg_inter_size : static_cast<int>(inter_size);
@@ -1340,6 +1407,7 @@ ov::Output<ov::Node> make_moe(
     // TODO: design issue
     bool is_pa = true;
     config.has_batch_dim = is_pa ? 0 : 1;
+    config.num_shared_expert = num_shared_expert;
 
     ov::OutputVector args = {
         hidden_f16,
@@ -1347,6 +1415,10 @@ ov::Output<ov::Node> make_moe(
         gate_w, gate_s, gate_z,
         up_w, up_s, up_z,
         down_w, down_s, down_z};
+
+    if (num_shared_expert > 0) {
+        args.insert(args.end(), shared_inputs.begin(), shared_inputs.end());
+    }
 
     auto moe = std::make_shared<ov::op::internal::MOE3GemmFusedCompressed>(args, config);
     auto moe_f32 = std::make_shared<ov::op::v0::Convert>(moe, ov::element::f32);
@@ -1779,7 +1851,7 @@ ov::Output<ov::Node> moe_layer_internal(
     std::string gate_concat_key = layer_prefix + ".experts.gate_proj_fused";
     std::string up_concat_key = layer_prefix + ".experts.up_proj_fused";
     std::string down_concat_key = layer_prefix + ".experts.down_proj_fused";
-    
+
     auto fused_gate_weights = make_int4_weights_for_moe(gate_concat_key, consts,
         false, -1);
     auto fused_up_weights = make_int4_weights_for_moe(up_concat_key, consts,
@@ -1793,6 +1865,37 @@ ov::Output<ov::Node> moe_layer_internal(
     std::cout << "fused_gate_scaling shape: " << fused_gate_weights[1].get_partial_shape() << std::endl;
     std::cout << "fused_up_scaling shape: " << fused_up_weights[1].get_partial_shape() << std::endl;
     std::cout << "fused_down_scaling shape: " << fused_down_weights[1].get_partial_shape() << std::endl;
+
+    // Load shared expert weights
+    std::string shared_gate_key = layer_prefix + ".shared_expert.gate_proj";
+    std::string shared_up_key = layer_prefix + ".shared_expert.up_proj";
+    std::string shared_down_key = layer_prefix + ".shared_expert.down_proj";
+    std::string shared_gate_gate_key = layer_prefix + ".shared_expert_gate";
+    int num_shared_expert = 0;
+    std::vector<Output<Node>> shared_inputs;
+    if (consts.count(shared_gate_key + ".weight")) {
+        num_shared_expert = 1;
+        auto shared_gate_w = make_int4_weights_for_moe(shared_gate_key, consts, false, -1);
+        auto shared_up_w = make_int4_weights_for_moe(shared_up_key, consts, false, -1);
+        auto shared_down_w = make_int4_weights_for_moe(shared_down_key, consts, false, -1);
+
+        shared_inputs.push_back(shared_gate_w[0]);
+        shared_inputs.push_back(shared_gate_w[1]);
+        shared_inputs.push_back(shared_gate_w[2]);
+        shared_inputs.push_back(shared_up_w[0]);
+        shared_inputs.push_back(shared_up_w[1]);
+        shared_inputs.push_back(shared_up_w[2]);
+        shared_inputs.push_back(shared_down_w[0]);
+        shared_inputs.push_back(shared_down_w[1]);
+        shared_inputs.push_back(shared_down_w[2]);
+
+        if (consts.count(shared_gate_gate_key + ".weight")) {
+             auto shared_gate_gate_w = make_weights_subgraph(shared_gate_gate_key, consts,
+                qtypes.count(shared_gate_gate_key + ".qtype") ? qtypes.at(shared_gate_gate_key + ".qtype") : gguf_tensor_type::GGUF_TYPE_F16,
+                false, -1);
+             shared_inputs.push_back(shared_gate_gate_w);
+        }
+    }
 
     // 8. Create MOE internal op
     ov::OutputVector moe_inputs = {
@@ -1809,6 +1912,10 @@ ov::Output<ov::Node> moe_layer_internal(
         fused_down_weights[2]
     };
     
+    if (num_shared_expert > 0) {
+        moe_inputs.insert(moe_inputs.end(), shared_inputs.begin(), shared_inputs.end());
+    }
+
     ov::op::internal::MOE3GemmFusedCompressed::Config config;
     config.hidden_size = hidden_states_flat->get_output_partial_shape(0)[1].get_length();
     config.inter_size = fused_gate_weights[0].get_partial_shape()[1].get_length();
@@ -1816,6 +1923,10 @@ ov::Output<ov::Node> moe_layer_internal(
     config.top_k = topk;
     config.group_size = 32;
     config.out_type = ov::element::f16;
+    // We assume shared experts exist if we are adding them to inputs (which we did unconditionally above,
+    // but in reality we should probably check if keys exist or if user wants shared experts)
+    // For now, assuming this function is only called for architectures with shared experts (e.g. Qwen2-MoE / Qwen3-MoE)
+    config.num_shared_expert = num_shared_expert;
 
     auto moe_node = std::make_shared<ov::op::internal::MOE3GemmFusedCompressed>(moe_inputs, config);
     std::cout << "moe_node output shape: " << moe_node->get_output_partial_shape(0) << std::endl;
