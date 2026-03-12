@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <fstream>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
@@ -44,6 +45,7 @@ struct SampleOptions {
     std::string mode;
     std::filesystem::path image_path;
     std::string user_prompt;
+    std::optional<std::filesystem::path> prompt_file;
     std::string device = "GPU";
     int max_new_tokens = 64;
     bool cache_model = false;
@@ -131,7 +133,8 @@ void print_usage(const char* argv0) {
         << "  --mode text|vl                  Run path (default: text)\n"
         << "  --image PATH                    Image path for vl mode. Required with --model --mode vl\n"
         << "                                  In dummy vl mode, if omitted, built-in 256x256 dummy image is used\n"
-        << "  --prompt TEXT                   User prompt\n"
+        << "  --prompt TEXT                   User prompt (inline text)\n"
+        << "  --prompt-file PATH              User prompt read from a file (use for long prompts to avoid CLI length limits)\n"
         << "  --device NAME                   OpenVINO device name (default: GPU)\n"
         << "  --output-tokens N               Number of generated tokens (default: 64)\n"
         << "  --cache-model                   Enable model caching behavior.\n"
@@ -201,6 +204,8 @@ SampleOptions parse_cli(int argc, char* argv[]) {
             opts.image_path = take_value("--image");
         } else if (arg == "--prompt") {
             opts.user_prompt = take_value("--prompt");
+        } else if (arg == "--prompt-file") {
+            opts.prompt_file = take_value("--prompt-file");
         } else if (arg == "--device") {
             opts.device = take_value("--device");
         } else if (arg == "--output-tokens") {
@@ -235,6 +240,16 @@ SampleOptions parse_cli(int argc, char* argv[]) {
 
     if (opts.max_new_tokens <= 0) {
         throw std::runtime_error("max_new_tokens must be > 0");
+    }
+    if (opts.prompt_file.has_value()) {
+        std::ifstream ifs(*opts.prompt_file);
+        if (!ifs) {
+            throw std::runtime_error("Cannot open prompt file: " + opts.prompt_file->string());
+        }
+        opts.user_prompt = std::string(std::istreambuf_iterator<char>(ifs), std::istreambuf_iterator<char>());
+        if (opts.user_prompt.empty()) {
+            throw std::runtime_error("Prompt file is empty: " + opts.prompt_file->string());
+        }
     }
     if (opts.user_prompt.empty()) {
         opts.user_prompt = (opts.mode == "vl") ? "Describe the image." : "Write one sentence about OpenVINO.";
