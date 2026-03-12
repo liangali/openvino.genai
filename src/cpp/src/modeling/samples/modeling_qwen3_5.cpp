@@ -24,6 +24,7 @@
 #include <openvino/core/type/float16.hpp>
 #include <openvino/op/constant.hpp>
 #include <openvino/openvino.hpp>
+#include <openvino/runtime/intel_gpu/properties.hpp>
 
 #include "openvino/genai/chat_history.hpp"
 #include "openvino/genai/generation_config.hpp"
@@ -890,6 +891,11 @@ int main(int argc, char* argv[]) try {
         opts.cache_model && !use_dummy_mode_flag && use_vl && has_ir_model_pair(vision_xml_path, vision_bin_path);
 
     ov::Core core;
+    // Enable large (>4 GB) single-buffer allocations on GPU.
+    // Required for models whose combined KV cache exceeds the per-object OpenCL limit
+    // (e.g. Qwen3.5-35B-A3B at 4K+ tokens: all-layers KV cache ~5 GB > 4.29 GB Arc 140T limit).
+    if (opts.device.find("GPU") != std::string::npos)
+        core.set_property(opts.device, ov::intel_gpu::hint::enable_large_allocations(true));
     std::unique_ptr<ov::genai::modeling::weights::WeightSource> source;
     auto ensure_weight_source = [&]() -> ov::genai::modeling::weights::WeightSource& {
         if (!source) {
