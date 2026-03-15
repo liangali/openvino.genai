@@ -535,7 +535,7 @@ Tensor Qwen3_5GatedDeltaNet::forward(const Tensor& hidden_states,
 
     if (use_linear_attention_op()) {
         // ── Fused LinearAttention op path ──
-        auto la_result = ops::linear_attention(q_f32, k_f32, v_f32, beta, g, recurrent_cached);
+        auto la_result = ops::linear_attention(q_heads, k_heads, v_heads, beta, g, recurrent_cached);
         core_attn_tensor = la_result.first;   // [B, S, num_v_heads, head_v_dim]
         auto recurrent_final = la_result.second;  // [B, num_v_heads, head_k_dim, head_v_dim]
         auto recurrent_assign = std::make_shared<ov::opset13::Assign>(recurrent_final.output(), recurrent_var);
