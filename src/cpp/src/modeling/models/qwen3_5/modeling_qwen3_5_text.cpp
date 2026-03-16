@@ -917,7 +917,10 @@ Tensor Qwen3_5ForCausalLM::forward(const Tensor& input_ids,
                                  cache_position,
                                  visual_embeds,
                                  visual_pos_mask);
-    return lm_head_.forward(hidden);
+    // Select only the last token before the LM head to avoid materializing
+    // the full [seq, vocab] logits tensor (e.g. 9907 × 248320 × 4B = 9.2 GB).
+    auto last_hidden = ops::slice(hidden, -1, std::numeric_limits<int64_t>::max(), 1, 1);
+    return lm_head_.forward(last_hidden);
 }
 
 Tensor Qwen3_5ForCausalLM::forward_embeds(const Tensor& inputs_embeds,
@@ -936,7 +939,8 @@ Tensor Qwen3_5ForCausalLM::forward_embeds(const Tensor& inputs_embeds,
                                         cache_position,
                                         visual_embeds,
                                         visual_pos_mask);
-    return lm_head_.forward(hidden);
+    auto last_hidden = ops::slice(hidden, -1, std::numeric_limits<int64_t>::max(), 1, 1);
+    return lm_head_.forward(last_hidden);
 }
 
 std::shared_ptr<ov::Model> create_qwen3_5_text_model(
