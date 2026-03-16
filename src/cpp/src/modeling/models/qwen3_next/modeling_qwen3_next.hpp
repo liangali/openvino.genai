@@ -94,7 +94,8 @@ public:
                    const Tensor& beam_idx,
                    const Tensor& rope_cos,
                    const Tensor& rope_sin,
-                   const Tensor* attention_mask) const;
+                   const Tensor* attention_mask,
+                   const Tensor* precomputed_sdpa_mask = nullptr) const;
 
 private:
     const Tensor& q_proj_weight() const;
@@ -300,7 +301,8 @@ public:
                                       const Tensor* full_attention_mask,
                                       const Tensor* linear_attention_mask,
                                       const Tensor* cache_position,
-                                      const std::optional<Tensor>& residual) const;
+                                      const std::optional<Tensor>& residual,
+                                      const Tensor* precomputed_full_attn_sdpa_mask = nullptr) const;
 
 private:
     std::string layer_type_;

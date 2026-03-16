@@ -246,3 +246,32 @@ add_custom_command(TARGET modeling_qwen3_tts POST_BUILD
 set_target_properties(modeling_qwen3_tts PROPERTIES
     # Ensure out of box LC_RPATH on macOS with SIP
     INSTALL_RPATH_USE_LINK_PATH ON)
+
+# Qwen3-ASR sample
+add_executable(modeling_qwen3_asr
+    modeling_qwen3_asr.cpp
+    $<TARGET_OBJECTS:openvino_genai_obj>)
+
+target_include_directories(modeling_qwen3_asr PRIVATE
+    "${CMAKE_BINARY_DIR}"
+    "${OpenVINOGenAI_SOURCE_DIR}/src/cpp/src"
+    "${OpenVINOGenAI_SOURCE_DIR}/openvino/thirdparty/json/nlohmann_json/include"
+    $<TARGET_PROPERTY:openvino::genai,INTERFACE_INCLUDE_DIRECTORIES>)
+
+target_link_libraries(modeling_qwen3_asr PRIVATE
+    $<TARGET_PROPERTY:openvino_genai_obj,LINK_LIBRARIES>)
+
+target_compile_definitions(modeling_qwen3_asr PRIVATE
+    openvino_genai_EXPORTS)
+
+add_dependencies(modeling_qwen3_asr openvino_genai)
+
+add_custom_command(TARGET modeling_qwen3_asr POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE_DIR:openvino_genai>/${tokenizers_dll_name}"
+            "$<TARGET_FILE_DIR:modeling_qwen3_asr>"
+    VERBATIM)
+
+set_target_properties(modeling_qwen3_asr PROPERTIES
+    # Ensure out of box LC_RPATH on macOS with SIP
+    INSTALL_RPATH_USE_LINK_PATH ON)

@@ -154,6 +154,10 @@ public:
     Tensor forward_no_cache(const Tensor& input_ids,
                             const Tensor& position_ids,
                             const Tensor& attention_mask);
+    Tensor forward_embeds(const Tensor& inputs_embeds,
+                          const Tensor& position_ids,
+                          const Tensor& beam_idx,
+                          const Tensor& attention_mask);
     std::pair<Tensor, Tensor> forward_with_penultimate_no_cache(const Tensor& input_ids,
                                                                 const Tensor& position_ids,
                                                                 const Tensor& attention_mask);
@@ -183,6 +187,10 @@ public:
                    const Tensor& position_ids,
                    const Tensor& beam_idx,
                    const Tensor& attention_mask);
+    Tensor forward_embeds(const Tensor& inputs_embeds,
+                          const Tensor& position_ids,
+                          const Tensor& beam_idx,
+                          const Tensor& attention_mask);
 
     Qwen3Model& model();
     LMHead& lm_head();

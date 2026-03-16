@@ -117,6 +117,11 @@ private:
     Tensor down_exps_scales() const;
     Tensor down_exps_zps() const;
 
+    bool can_use_fused_path() const;
+    size_t infer_group_size() const;
+    Tensor routed_fused(const Tensor& flat_f32) const;
+    Tensor routed_fallback(const Tensor& flat_f32) const;
+
     WeightParameter* gate_inp_param_ = nullptr;
     std::vector<WeightParameter*> gate_exps_param_;
     std::vector<WeightParameter*> up_exps_param_;
@@ -134,6 +139,9 @@ private:
     int32_t num_experts_ = 0;
     int32_t top_k_ = 1;
     size_t  group_size_ = 128;
+    bool has_gate_quant_ = false;
+    bool has_up_quant_ = false;
+    bool has_down_quant_ = false;
 };
 
 class Qwen3MoeDecoderLayer : public Module {

@@ -5,6 +5,8 @@
 #include <limits>
 #include <string>
 #include <iostream>
+#include <cstdio>
+#include <vector>
 
 #include "imwrite.hpp"
 
@@ -144,10 +146,14 @@ void imwrite(const std::string& name, ov::Tensor images, bool convert_bgr2rgb) {
     uint8_t* img_data = images.data<uint8_t>();
 
     for (int img_num = 0, num_images = shape[0], img_size = ov::shape_size(img_shape); img_num < num_images; ++img_num, img_data += img_size) {
-        char img_name[25];
-        sprintf(img_name, name.c_str(), img_num);
+        // Avoid fixed-size buffers: output paths can be long and include formatting tokens.
+        const int name_len = std::snprintf(nullptr, 0, name.c_str(), img_num);
+        OPENVINO_ASSERT(name_len >= 0, "Failed to format output image path");
+        std::vector<char> img_name(static_cast<size_t>(name_len) + 1);
+        const int written = std::snprintf(img_name.data(), img_name.size(), name.c_str(), img_num);
+        OPENVINO_ASSERT(written == name_len, "Formatted output image path length mismatch");
 
         ov::Tensor image(images.get_element_type(), img_shape, img_data);
-        imwrite_single_image(img_name, image, true);
+        imwrite_single_image(std::string(img_name.data()), image, convert_bgr2rgb);
     }
 }

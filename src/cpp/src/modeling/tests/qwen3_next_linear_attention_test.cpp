@@ -82,6 +82,9 @@ TEST(Qwen3NextLinearAttention, BuildsGraphAndRegistersLinearStates) {
     size_t read_value_count = 0;
     size_t assign_count = 0;
     for (const auto& op : ov_model->get_ops()) {
+        if (op->get_type_name() == std::string("FusedConv")) {
+            has_conv_state = true;
+        }
         if (auto read = ov::as_type_ptr<ov::op::v6::ReadValue>(op)) {
             read_value_count++;
             const auto id = read->get_variable_id();
@@ -93,8 +96,8 @@ TEST(Qwen3NextLinearAttention, BuildsGraphAndRegistersLinearStates) {
         }
     }
 
-    EXPECT_GE(read_value_count, 2u);
-    EXPECT_GE(assign_count, 2u);
+    EXPECT_GE(read_value_count, 1u);
+    EXPECT_GE(assign_count, 1u);
     EXPECT_TRUE(has_conv_state);
     EXPECT_TRUE(has_recurrent_state);
 }

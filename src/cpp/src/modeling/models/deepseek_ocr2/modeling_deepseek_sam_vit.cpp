@@ -230,8 +230,9 @@ add_decomposed_rel_pos(const ov::genai::modeling::Tensor& q,
     auto rel_h_mul = q_exp * rel_h_exp;
     auto rel_w_mul = q_exp * rel_w_exp;
 
-    auto rel_h_sum = reduce_sum(rel_h_mul, 4, false);
-    auto rel_w_sum = reduce_sum(rel_w_mul, 4, false);
+    // Keep reduced axis, then squeeze explicitly to avoid backend rank-mismatch issues.
+    auto rel_h_sum = reduce_sum(rel_h_mul, 4, true).squeeze(4);
+    auto rel_w_sum = reduce_sum(rel_w_mul, 4, true).squeeze(4);
 
     auto one_dim = ov::genai::modeling::ops::const_vec(ctx, std::vector<int64_t>{1});
     auto hw = mul_dim(q_h_i64.output(), q_w_i64.output());

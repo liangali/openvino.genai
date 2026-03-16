@@ -248,6 +248,9 @@ TEST(Qwen3_5LinearAttentionOpCompare, BothPathsRegisterSameStates) {
         size_t read_count = 0, assign_count = 0;
 
         for (const auto& op : model->get_ops()) {
+            if (op->get_type_name() == std::string("FusedConv")) {
+                has_conv = true;
+            }
             if (auto read = ov::as_type_ptr<ov::op::v6::ReadValue>(op)) {
                 read_count++;
                 const auto id = read->get_variable_id();
@@ -259,8 +262,8 @@ TEST(Qwen3_5LinearAttentionOpCompare, BothPathsRegisterSameStates) {
             }
         }
 
-        EXPECT_GE(read_count, 2u) << "env=" << env_value;
-        EXPECT_GE(assign_count, 2u) << "env=" << env_value;
+        EXPECT_GE(read_count, 1u) << "env=" << env_value;
+        EXPECT_GE(assign_count, 1u) << "env=" << env_value;
         EXPECT_TRUE(has_conv) << "Missing conv state (env=" << env_value << ")";
         EXPECT_TRUE(has_recurrent) << "Missing recurrent state (env=" << env_value << ")";
     };

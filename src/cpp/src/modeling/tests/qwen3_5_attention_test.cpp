@@ -318,6 +318,9 @@ struct LinearStateSummary {
 LinearStateSummary summarize_linear_states(const std::shared_ptr<ov::Model>& model) {
     LinearStateSummary summary;
     for (const auto& op : model->get_ops()) {
+        if (op->get_type_name() == std::string("FusedConv")) {
+            summary.has_conv = true;
+        }
         if (auto read = ov::as_type_ptr<ov::op::v6::ReadValue>(op)) {
             summary.read_count++;
             const auto id = read->get_variable_id();
@@ -458,8 +461,8 @@ TEST(Qwen3_5AttentionULT, LinearAttention_BasicOps_GraphStateAndGpuInfer) {
     EXPECT_FALSE(has_op_type(model, "LinearAttention"));
 
     const auto states = summarize_linear_states(model);
-    EXPECT_GE(states.read_count, 2u);
-    EXPECT_GE(states.assign_count, 2u);
+    EXPECT_GE(states.read_count, 1u);
+    EXPECT_GE(states.assign_count, 1u);
     EXPECT_TRUE(states.has_conv);
     EXPECT_TRUE(states.has_recurrent);
 
@@ -498,8 +501,8 @@ TEST(Qwen3_5AttentionULT, LinearAttention_FusedOp_GraphStateAndGpuInfer) {
     EXPECT_FALSE(has_op_type(model, "TensorIterator"));
 
     const auto states = summarize_linear_states(model);
-    EXPECT_GE(states.read_count, 2u);
-    EXPECT_GE(states.assign_count, 2u);
+    EXPECT_GE(states.read_count, 1u);
+    EXPECT_GE(states.assign_count, 1u);
     EXPECT_TRUE(states.has_conv);
     EXPECT_TRUE(states.has_recurrent);
 

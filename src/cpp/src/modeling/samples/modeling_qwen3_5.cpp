@@ -5,14 +5,17 @@
 #include <chrono>
 #include <fstream>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <random>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -38,6 +41,7 @@
 #include "modeling/models/qwen3_5/qwen3_5_weight_specs.hpp"
 #include "modeling/weights/quantization_config.hpp"
 #include "modeling/weights/synthetic_weight_source.hpp"
+#include "sampling/logit_processor.hpp"
 
 namespace {
 
@@ -55,6 +59,17 @@ struct SampleOptions {
 
     std::optional<int> num_layers;
     int max_pixels = 0;
+
+    // Sampling parameters – defaults follow Qwen3.5 official recommendations
+    // for "thinking mode, general tasks".
+    float temperature = 1.0f;
+    float top_p = 0.95f;
+    size_t top_k = 20;
+    float repetition_penalty = 1.0f;
+    float frequency_penalty = 0.0f;
+    float presence_penalty = 1.5f;
+    size_t rng_seed = 0;  // 0 = use random_device
+    bool enable_thinking = true;  // --think 0/1
 };
 
 bool has_safetensors_file(const std::filesystem::path& model_dir) {
@@ -103,11 +118,27 @@ int parse_i32(const std::string& raw, const char* option_name) {
     }
 }
 
+float parse_float(const std::string& raw, const char* option_name) {
+    try {
+        return std::stof(raw);
+    } catch (const std::exception&) {
+        throw std::runtime_error(std::string("Invalid float for ") + option_name + ": " + raw);
+    }
+}
+
 std::string to_lower(std::string value) {
     for (auto& c : value) {
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     }
     return value;
+}
+
+std::string read_text_file(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error("Failed to open prompt file: " + path.string());
+    }
+    return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
 }
 
 void print_usage(const char* argv0) {
@@ -150,6 +181,14 @@ void print_usage(const char* argv0) {
     << "  --num-layers N                  Run only the first N text transformer layers (dummy + real model)\n"
     << "  --max-pixels N                  Limit vision input to N pixels (default: from preprocessor_config.json)\n"
     << "                                  Recommended: 602112 (3072 tokens * 14^2 patch) for ARL-H GPU\n"
+    << "  --temperature FLOAT             Sampling temperature (default: 1.0, 0 = greedy argmax)\n"
+    << "  --top-p FLOAT                   Nucleus sampling threshold (default: 0.95)\n"
+    << "  --top-k INT                     Top-K filtering (default: 20)\n"
+    << "  --repetition-penalty FLOAT      Penalty for repeating tokens (default: 1.0)\n"
+    << "  --frequency-penalty FLOAT       Subtract penalty * token_count from logit (default: 0.0)\n"
+    << "  --presence-penalty FLOAT        Subtract penalty if token appeared (default: 1.5)\n"
+    << "  --rng-seed INT                  Random seed for sampling (default: 0 = random)\n"
+    << "  --think 0|1                     Enable/disable thinking mode (default: 1 = enabled)\n"
         << "  -h, --help                      Show this helper\n";
 }
 
@@ -219,6 +258,23 @@ SampleOptions parse_cli(int argc, char* argv[]) {
             opts.num_layers = parse_i32(take_value("--num-layers"), "--num-layers");
         } else if (arg == "--max-pixels") {
             opts.max_pixels = parse_i32(take_value("--max-pixels"), "--max-pixels");
+        } else if (arg == "--temperature") {
+            opts.temperature = parse_float(take_value("--temperature"), "--temperature");
+        } else if (arg == "--top-p") {
+            opts.top_p = parse_float(take_value("--top-p"), "--top-p");
+        } else if (arg == "--top-k") {
+            opts.top_k = static_cast<size_t>(parse_i32(take_value("--top-k"), "--top-k"));
+        } else if (arg == "--repetition-penalty") {
+            opts.repetition_penalty = parse_float(take_value("--repetition-penalty"), "--repetition-penalty");
+        } else if (arg == "--frequency-penalty") {
+            opts.frequency_penalty = parse_float(take_value("--frequency-penalty"), "--frequency-penalty");
+        } else if (arg == "--presence-penalty") {
+            opts.presence_penalty = parse_float(take_value("--presence-penalty"), "--presence-penalty");
+        } else if (arg == "--rng-seed") {
+            opts.rng_seed = static_cast<size_t>(parse_i32(take_value("--rng-seed"), "--rng-seed"));
+        } else if (arg == "--think") {
+            int val = parse_i32(take_value("--think"), "--think");
+            opts.enable_thinking = (val != 0);
         } else {
             throw std::runtime_error("Unknown option: " + arg);
         }
@@ -325,52 +381,262 @@ std::set<int64_t> resolve_stop_token_ids(const std::filesystem::path& model_dir,
     return stop_token_ids;
 }
 
-int64_t argmax_last_token(const ov::Tensor& logits) {
+
+// Extract the last token's logits from [1, S, V] into a float32 scratch buffer.
+// Handles f32, f16, and bf16 logit tensors.
+void extract_last_logits_f32(const ov::Tensor& logits, std::vector<float>& out) {
     const auto shape = logits.get_shape();
-    if (shape.size() != 3 || shape[0] != 1) {
-        throw std::runtime_error("logits must have shape [1, S, V]");
-    }
     const size_t seq_len = shape[1];
     const size_t vocab = shape[2];
     const size_t offset = (seq_len - 1) * vocab;
+    out.resize(vocab);
+    if (logits.get_element_type() == ov::element::f32) {
+        std::memcpy(out.data(), logits.data<const float>() + offset, vocab * sizeof(float));
+    } else if (logits.get_element_type() == ov::element::f16) {
+        const auto* src = logits.data<const ov::float16>() + offset;
+        for (size_t i = 0; i < vocab; ++i)
+            out[i] = static_cast<float>(src[i]);
+    } else if (logits.get_element_type() == ov::element::bf16) {
+        const auto* src = logits.data<const ov::bfloat16>() + offset;
+        for (size_t i = 0; i < vocab; ++i)
+            out[i] = static_cast<float>(src[i]);
+    } else {
+        throw std::runtime_error("Unsupported logits dtype for logit processing");
+    }
+}
 
-    if (logits.get_element_type() == ov::element::f16) {
-        const auto* data = logits.data<const ov::float16>() + offset;
-        ov::float16 max_val = data[0];
-        size_t max_idx = 0;
-        for (size_t i = 1; i < vocab; ++i) {
-            if (data[i] > max_val) {
-                max_val = data[i];
-                max_idx = i;
+int64_t argmax_f32(const std::vector<float>& data) {
+    return static_cast<int64_t>(std::max_element(data.begin(), data.end()) - data.begin());
+}
+
+// ---------------------------------------------------------------------------
+// Fast multinomial sampling — avoids full-vocab softmax and sort.
+//
+// Strategy (for the common case: temperature>0, top_k>0, top_p<1):
+//   1. nth_element to partition top-K logits            — O(V) avg
+//   2. Sort only the K candidates                       — O(K log K)
+//   3. Apply temperature + softmax on K candidates only — O(K)
+//   4. Apply top-P cutoff on K candidates               — O(K)
+//   5. Direct CDF sampling                              — O(K)
+// Total: O(V) + O(K log K), vs original O(5V + V log V).
+// ---------------------------------------------------------------------------
+
+struct SamplingContext {
+    // Scratch buffers reused across decode steps.
+    std::vector<std::pair<float, int64_t>> ranked;  // top-K candidates (logit, token_id), size K
+    std::vector<std::pair<float, int64_t>> candidates;  // full-vocab buffer (only for Case 3: top-P without top-K)
+    std::vector<float> probs;                            // softmax probs of selected candidates
+};
+
+int64_t sample_fast(const float* logits,
+                    size_t vocab_size,
+                    float temperature,
+                    float top_p,
+                    size_t top_k,
+                    std::mt19937& rng,
+                    SamplingContext& ctx) {
+    OPENVINO_ASSERT(vocab_size > 0, "logits must not be empty");
+    OPENVINO_ASSERT(temperature > 0.0f, "temperature must be positive for sampling");
+
+    const bool use_top_k = (top_k > 0 && top_k < vocab_size);
+    const bool use_top_p = (top_p > 0.0f && top_p < 1.0f);
+
+    // --- Case 1: No top-K, no top-P — full-vocab softmax + CDF sampling (single pass) ---
+    if (!use_top_k && !use_top_p) {
+        // Find max for numerical stability
+        float max_logit = *std::max_element(logits, logits + vocab_size);
+        float inv_temp = 1.0f / temperature;
+
+        // Compute exp and accumulate sum in one pass
+        ctx.probs.resize(vocab_size);
+        float total = 0.0f;
+        for (size_t i = 0; i < vocab_size; ++i) {
+            float val = std::exp((logits[i] - max_logit) * inv_temp);
+            ctx.probs[i] = val;
+            total += val;
+        }
+
+        // Guard against degenerate distributions (NaN/Inf/zero)
+        if (!(total > 0.0f) || !std::isfinite(total)) {
+            return static_cast<int64_t>(std::max_element(logits, logits + vocab_size) - logits);
+        }
+
+        // Sample via CDF
+        std::uniform_real_distribution<float> udist(0.0f, total);
+        float dart = udist(rng);
+        float cumsum = 0.0f;
+        for (size_t i = 0; i < vocab_size; ++i) {
+            cumsum += ctx.probs[i];
+            if (cumsum >= dart) {
+                return static_cast<int64_t>(i);
             }
         }
-        return static_cast<int64_t>(max_idx);
+        return static_cast<int64_t>(vocab_size - 1);
     }
-    if (logits.get_element_type() == ov::element::bf16) {
-        const auto* data = logits.data<const ov::bfloat16>() + offset;
-        ov::bfloat16 max_val = data[0];
-        size_t max_idx = 0;
-        for (size_t i = 1; i < vocab; ++i) {
-            if (data[i] > max_val) {
-                max_val = data[i];
-                max_idx = i;
+
+    // --- Case 2: top-K (with optional top-P) — the common path ---
+    // Uses a single sequential read pass over logits (same cache pattern as argmax)
+    // with a tiny K-element buffer that stays in L1 cache.
+    // Memory: reads 600KB (logit_buf), writes ~240 bytes (K=20 buffer).
+    if (use_top_k) {
+        size_t k = std::min(top_k, vocab_size);
+        ctx.ranked.resize(k);
+
+        // Initialize with first K logits
+        for (size_t i = 0; i < k; ++i) {
+            ctx.ranked[i] = {logits[i], static_cast<int64_t>(i)};
+        }
+
+        // Find current minimum in the K-element buffer
+        size_t min_pos = 0;
+        float min_val = ctx.ranked[0].first;
+        for (size_t i = 1; i < k; ++i) {
+            if (ctx.ranked[i].first < min_val) {
+                min_val = ctx.ranked[i].first;
+                min_pos = i;
             }
         }
-        return static_cast<int64_t>(max_idx);
+
+        // Single sequential scan over remaining logits — O(V) read-only
+        // Only touches the K-element buffer when a new top-K candidate is found.
+        for (size_t i = k; i < vocab_size; ++i) {
+            if (logits[i] > min_val) {
+                ctx.ranked[min_pos] = {logits[i], static_cast<int64_t>(i)};
+                // Rescan tiny buffer for new minimum (~20 comparisons, L1-resident)
+                min_val = ctx.ranked[0].first;
+                min_pos = 0;
+                for (size_t j = 1; j < k; ++j) {
+                    if (ctx.ranked[j].first < min_val) {
+                        min_val = ctx.ranked[j].first;
+                        min_pos = j;
+                    }
+                }
+            }
+        }
+
+        // Sort only K elements descending — O(K log K), trivial for K=20
+        std::sort(ctx.ranked.begin(), ctx.ranked.end(),
+                  [](const auto& a, const auto& b) { return a.first > b.first; });
+
+        // Apply temperature + softmax on K candidates only
+        float max_logit = ctx.ranked[0].first;
+        float inv_temp = 1.0f / temperature;
+        ctx.probs.resize(k);
+        float total = 0.0f;
+        for (size_t i = 0; i < k; ++i) {
+            float val = std::exp((ctx.ranked[i].first - max_logit) * inv_temp);
+            ctx.probs[i] = val;
+            total += val;
+        }
+
+        // Guard against degenerate distributions (NaN/Inf/zero)
+        if (!(total > 0.0f) || !std::isfinite(total)) {
+            return ctx.ranked[0].second;  // fallback to highest logit
+        }
+
+        // Apply top-P cutoff if needed (ensure at least 1 candidate survives)
+        size_t num_candidates = k;
+        if (use_top_p) {
+            float threshold = top_p * total;
+            float cumsum = 0.0f;
+            for (size_t i = 0; i < k; ++i) {
+                cumsum += ctx.probs[i];
+                if (cumsum >= threshold) {
+                    num_candidates = i + 1;
+                    total = cumsum;
+                    break;
+                }
+            }
+        }
+        num_candidates = std::max<size_t>(1, num_candidates);
+
+        // Direct CDF sampling from the surviving candidates
+        std::uniform_real_distribution<float> udist(0.0f, total);
+        float dart = udist(rng);
+        float cumsum = 0.0f;
+        for (size_t i = 0; i < num_candidates; ++i) {
+            cumsum += ctx.probs[i];
+            if (cumsum >= dart) {
+                return ctx.ranked[i].second;
+            }
+        }
+        return ctx.ranked[num_candidates - 1].second;
     }
-    if (logits.get_element_type() != ov::element::f32) {
-        throw std::runtime_error("Unsupported logits dtype");
+
+    // --- Case 3: top-P only (no top-K) ---
+    // Use partial sort with adaptive step, similar to original TopPFilter.
+    ctx.candidates.resize(vocab_size);
+    for (size_t i = 0; i < vocab_size; ++i) {
+        ctx.candidates[i] = {logits[i], static_cast<int64_t>(i)};
     }
-    const auto* data = logits.data<const float>() + offset;
-    float max_val = data[0];
-    size_t max_idx = 0;
-    for (size_t i = 1; i < vocab; ++i) {
-        if (data[i] > max_val) {
-            max_val = data[i];
-            max_idx = i;
+
+    // Apply temperature + softmax on full vocab to get probabilities
+    float max_logit = std::max_element(ctx.candidates.begin(), ctx.candidates.end(),
+                                       [](const auto& a, const auto& b) { return a.first < b.first; })->first;
+    float inv_temp = 1.0f / temperature;
+    float total = 0.0f;
+    for (size_t i = 0; i < vocab_size; ++i) {
+        ctx.candidates[i].first = std::exp((ctx.candidates[i].first - max_logit) * inv_temp);
+        total += ctx.candidates[i].first;
+    }
+
+    // Guard against degenerate distributions (NaN/Inf/zero)
+    if (!(total > 0.0f) || !std::isfinite(total)) {
+        // Find the candidate with the highest original logit (max_logit)
+        for (size_t i = 0; i < vocab_size; ++i) {
+            if (logits[i] == max_logit) return static_cast<int64_t>(i);
+        }
+        return static_cast<int64_t>(0);
+    }
+
+    float threshold = top_p * total;
+
+    // Try partial sort with increasing step sizes to find top-P nucleus
+    size_t num_candidates = vocab_size;
+    for (size_t step = 16; step <= 1024; step *= 2) {
+        if (vocab_size <= step) break;
+        std::partial_sort(ctx.candidates.begin(),
+                          ctx.candidates.begin() + static_cast<ptrdiff_t>(step),
+                          ctx.candidates.end(),
+                          [](const auto& a, const auto& b) { return a.first > b.first; });
+        float cumsum = 0.0f;
+        for (size_t i = 0; i < step; ++i) {
+            cumsum += ctx.candidates[i].first;
+            if (cumsum >= threshold) {
+                num_candidates = i + 1;
+                total = cumsum;
+                goto nucleus_found;
+            }
         }
     }
-    return static_cast<int64_t>(max_idx);
+    // Fallback: full sort
+    std::sort(ctx.candidates.begin(), ctx.candidates.end(),
+              [](const auto& a, const auto& b) { return a.first > b.first; });
+    {
+        float cumsum = 0.0f;
+        for (size_t i = 0; i < vocab_size; ++i) {
+            cumsum += ctx.candidates[i].first;
+            if (cumsum >= threshold) {
+                num_candidates = i + 1;
+                total = cumsum;
+                break;
+            }
+        }
+    }
+
+nucleus_found:
+    num_candidates = std::max<size_t>(1, num_candidates);
+    // Direct CDF sampling
+    std::uniform_real_distribution<float> udist(0.0f, total);
+    float dart = udist(rng);
+    float cumsum = 0.0f;
+    for (size_t i = 0; i < num_candidates; ++i) {
+        cumsum += ctx.candidates[i].first;
+        if (cumsum >= dart) {
+            return ctx.candidates[i].second;
+        }
+    }
+    return ctx.candidates[num_candidates - 1].second;
 }
 
 ov::Tensor make_beam_idx(size_t batch) {
@@ -796,7 +1062,8 @@ int main(int argc, char* argv[]) try {
                 if (!tokenizer->get_chat_template().empty()) {
                     ov::genai::ChatHistory history({{{"role", "user"}, {"content", prompt}}});
                     constexpr bool add_generation_prompt = true;
-                    prompt = tokenizer->apply_chat_template(history, add_generation_prompt);
+                    ov::genai::JsonContainer extra({{"enable_thinking", opts.enable_thinking}});
+                    prompt = tokenizer->apply_chat_template(history, add_generation_prompt, {}, std::nullopt, extra);
                     add_special_tokens = false;
                 }
             }
@@ -840,6 +1107,11 @@ int main(int argc, char* argv[]) try {
     const size_t batch = input_ids.get_shape().at(0);
     const int64_t prompt_len = static_cast<int64_t>(input_ids.get_shape().at(1));
 
+    // Collect all prompt token IDs (flat, for LogitProcessor repetition tracking).
+    std::vector<int64_t> prompt_token_ids(
+        input_ids.data<const int64_t>(),
+        input_ids.data<const int64_t>() + input_ids.get_size());
+
     ov::genai::modeling::models::Qwen3_5InputPlanner planner(cfg);
     auto plan = planner.build_plan(input_ids, &attention_mask, use_vl ? &grid_thw : nullptr);
 
@@ -874,11 +1146,46 @@ int main(int argc, char* argv[]) try {
         text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kVisualPosMask, usm_visual_pos_mask);
     }
 
+    // Build GenerationConfig for penalty-only LogitProcessor.
+    // Temperature / TopP / TopK are handled by sample_fast() to avoid
+    // O(V log V) full-vocab softmax+sort on every decode step.
+    const bool use_sampling = opts.temperature > 0.0f;
+    ov::genai::GenerationConfig penalty_config;
+    penalty_config.do_sample = false;  // penalties only — no Temperature/TopP/TopK transforms
+    penalty_config.repetition_penalty = opts.repetition_penalty;
+    penalty_config.frequency_penalty = opts.frequency_penalty;
+    penalty_config.presence_penalty = opts.presence_penalty;
+    ov::genai::LogitProcessor penalty_processor(penalty_config, prompt_token_ids);
+
+    // RNG for multinomial sampling.
+    std::mt19937 rng(opts.rng_seed != 0
+                     ? static_cast<std::mt19937::result_type>(opts.rng_seed)
+                     : std::random_device{}());
+
+    // Reusable float32 scratch buffer for logit processing across all decode steps.
+    std::vector<float> logit_buf;
+
+    // Pre-allocated scratch buffers for fast sampling (reused across decode steps).
+    SamplingContext sampling_ctx;
+
     const auto prefill_start = std::chrono::steady_clock::now();
     text_request.infer();
     ov::Tensor logits = text_request.get_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kLogits);
-    int64_t next_id = argmax_last_token(logits);
     const auto prefill_end = std::chrono::steady_clock::now();
+
+    // Process prefill logits and select first token.
+    extract_last_logits_f32(logits, logit_buf);
+    int64_t next_id;
+    {
+        ov::genai::Logits lw(logit_buf.data(), logit_buf.size());
+        penalty_processor.apply(lw);  // penalties only — O(|generated|)
+        next_id = use_sampling
+                      ? sample_fast(logit_buf.data(), logit_buf.size(),
+                                    opts.temperature, opts.top_p, opts.top_k, rng, sampling_ctx)
+                      : argmax_f32(logit_buf);
+    }
+    penalty_processor.register_new_generated_token(next_id);
+    penalty_processor.update_generated_len(1);
 
     std::vector<int64_t> generated;
     generated.reserve(static_cast<size_t>(opts.max_new_tokens));
@@ -971,8 +1278,18 @@ int main(int argc, char* argv[]) try {
 
         text_request.infer();
         logits = text_request.get_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kLogits);
-        next_id = argmax_last_token(logits);
+        extract_last_logits_f32(logits, logit_buf);
+        {
+            ov::genai::Logits lw(logit_buf.data(), logit_buf.size());
+            penalty_processor.apply(lw);  // penalties only — O(|generated|)
+            next_id = use_sampling
+                          ? sample_fast(logit_buf.data(), logit_buf.size(),
+                                        opts.temperature, opts.top_p, opts.top_k, rng, sampling_ctx)
+                          : argmax_f32(logit_buf);
+        }
+        penalty_processor.register_new_generated_token(next_id);
         generated.push_back(next_id);
+        penalty_processor.update_generated_len(generated.size());
         decode_steps += 1;
         past_len += 1;
     }

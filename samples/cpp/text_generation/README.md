@@ -184,6 +184,11 @@ For more information how performance metrics are calculated please follow [perfo
 - `--mt, --max_new_tokens` (default: `20`): Maximal number of new tokens.
 - `-n, --num_iter` (default: `3`): Number of iterations.
 - `-d, --device` (default: `"CPU"`): Device to run the model on.
+- `--compression_mode` (default: `int4_asym`): In-flight quantization mode for raw HuggingFace safetensors models loaded through the explicit modeling path. Supported values: `none`, `int4_sym`, `int4_asym`, `int8_sym`, `int8_asym`.
+- `--group_size` (default: `128`): Group size for in-flight quantization.
+- `--backup_mode` (default: `int4_asym`): Backup quantization mode for sensitive layers in the explicit modeling path.
+
+  For hybrid-attention models such as `qwen3_5`, `qwen3_5_moe`, and `qwen3_next`, the sample automatically avoids forcing the continuous batching backend and lets `LLMPipeline` choose a compatible backend. This keeps the existing benchmark behavior for other models while allowing raw HuggingFace safetensors models to run through the explicit modeling path.
 
 ### 10. Structured Output Sample (`structured_output_sample`)
 - **Description:**  

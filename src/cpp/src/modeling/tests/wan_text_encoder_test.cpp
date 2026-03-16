@@ -85,7 +85,7 @@ TEST(WanTextEncoder, BuildsAndRuns) {
     auto model = ov::genai::modeling::models::create_umt5_text_encoder_model(cfg, weights, finalizer);
 
     ov::Core core;
-    auto compiled = core.compile_model(model, "CPU");
+    auto compiled = core.compile_model(model, "GPU");
     auto request = compiled.create_infer_request();
 
     std::vector<int64_t> input_ids_data(seq_len, 1);

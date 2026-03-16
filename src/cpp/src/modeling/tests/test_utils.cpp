@@ -590,49 +590,62 @@ std::vector<float> moe_ref(const std::vector<float>& hidden_states,
     std::vector<float> topk_w;
     std::vector<float> logits(num_experts, 0.0f);
 
-    for (size_t t = 0; t < tokens; ++t) {
-        const float* x = &hidden_states[t * hidden_size];
-        for (size_t e = 0; e < num_experts; ++e) {
-            float acc = 0.0f;
-            const size_t base = e * hidden_size;
-            for (size_t h = 0; h < hidden_size; ++h) {
-                acc += x[h] * gate_inp[base + h];
-            }
-            logits[e] = acc;
-        }
-        topk_softmax(logits.data(), num_experts, top_k, topk_idx, topk_w);
+    // hidden_states is interpreted as contiguous [B, S, H], which is equivalent
+    // to flattened [T, H] with T = B * S.
+    auto hidden_ptr = [&](size_t b, size_t s) -> const float* {
+        const size_t t = b * seq_len + s;
+        return &hidden_states[t * hidden_size];
+    };
+    auto out_ptr = [&](size_t b, size_t s) -> float* {
+        const size_t t = b * seq_len + s;
+        return &output[t * hidden_size];
+    };
 
-        for (size_t k = 0; k < top_k; ++k) {
-            const size_t e = topk_idx[k];
-            const float w = topk_w[k];
-
-            std::vector<float> gate(inter_size, 0.0f);
-            std::vector<float> up(inter_size, 0.0f);
-            for (size_t i = 0; i < inter_size; ++i) {
-                float acc_g = 0.0f;
-                float acc_u = 0.0f;
-                const size_t base = (e * inter_size + i) * hidden_size;
-                for (size_t h = 0; h < hidden_size; ++h) {
-                    acc_g += x[h] * gate_w[base + h];
-                    acc_u += x[h] * up_w[base + h];
-                }
-                gate[i] = swish(acc_g);
-                up[i] = acc_u;
-            }
-
-            std::vector<float> hidden(inter_size, 0.0f);
-            for (size_t i = 0; i < inter_size; ++i) {
-                hidden[i] = gate[i] * up[i];
-            }
-
-            float* out = &output[t * hidden_size];
-            for (size_t h = 0; h < hidden_size; ++h) {
+    for (size_t b = 0; b < batch; ++b) {
+        for (size_t s = 0; s < seq_len; ++s) {
+            const float* x = hidden_ptr(b, s);
+            for (size_t e = 0; e < num_experts; ++e) {
                 float acc = 0.0f;
-                const size_t base = (e * hidden_size + h) * inter_size;
-                for (size_t i = 0; i < inter_size; ++i) {
-                    acc += hidden[i] * down_w[base + i];
+                const size_t base = e * hidden_size;
+                for (size_t h = 0; h < hidden_size; ++h) {
+                    acc += x[h] * gate_inp[base + h];
                 }
-                out[h] += w * acc;
+                logits[e] = acc;
+            }
+            topk_softmax(logits.data(), num_experts, top_k, topk_idx, topk_w);
+
+            for (size_t k = 0; k < top_k; ++k) {
+                const size_t e = topk_idx[k];
+                const float w = topk_w[k];
+
+                std::vector<float> gate(inter_size, 0.0f);
+                std::vector<float> up(inter_size, 0.0f);
+                for (size_t i = 0; i < inter_size; ++i) {
+                    float acc_g = 0.0f;
+                    float acc_u = 0.0f;
+                    const size_t base = (e * inter_size + i) * hidden_size;
+                    for (size_t h = 0; h < hidden_size; ++h) {
+                        acc_g += x[h] * gate_w[base + h];
+                        acc_u += x[h] * up_w[base + h];
+                    }
+                    gate[i] = swish(acc_g);
+                    up[i] = acc_u;
+                }
+
+                std::vector<float> hidden(inter_size, 0.0f);
+                for (size_t i = 0; i < inter_size; ++i) {
+                    hidden[i] = gate[i] * up[i];
+                }
+
+                float* out = out_ptr(b, s);
+                for (size_t h = 0; h < hidden_size; ++h) {
+                    float acc = 0.0f;
+                    const size_t base = (e * hidden_size + h) * inter_size;
+                    for (size_t i = 0; i < inter_size; ++i) {
+                        acc += hidden[i] * down_w[base + i];
+                    }
+                    out[h] += w * acc;
+                }
             }
         }
     }

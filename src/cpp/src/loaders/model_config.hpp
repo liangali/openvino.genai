@@ -173,6 +173,35 @@ struct ModelConfig {
 
     /// Optional list of dense MLP-only layer indices
     std::vector<int32_t> mlp_only_layers;
+
+    // ========== Qwen3-ASR nested audio_config ==========
+
+    /// Audio encoder mel bins (thinker_config.audio_config.num_mel_bins)
+    int32_t audio_num_mel_bins = 0;
+
+    /// Audio encoder hidden size (thinker_config.audio_config.d_model)
+    int32_t audio_hidden_size = 0;
+
+    /// Audio encoder FFN size (thinker_config.audio_config.encoder_ffn_dim)
+    int32_t audio_intermediate_size = 0;
+
+    /// Audio encoder number of layers (thinker_config.audio_config.encoder_layers)
+    int32_t audio_num_hidden_layers = 0;
+
+    /// Audio encoder attention heads (thinker_config.audio_config.encoder_attention_heads)
+    int32_t audio_num_attention_heads = 0;
+
+    /// Audio encoder max source positions (thinker_config.audio_config.max_source_positions)
+    int32_t audio_max_position_embeddings = 0;
+
+    /// Audio encoder downsample hidden size (thinker_config.audio_config.downsample_hidden_size)
+    int32_t audio_downsample_hidden_size = 0;
+
+    /// Audio encoder output embedding size (thinker_config.audio_config.output_dim)
+    int32_t audio_output_dim = 0;
+
+    /// Audio encoder activation (thinker_config.audio_config.activation_function)
+    std::string audio_hidden_act;
     
     // ========== Quantization ==========
     

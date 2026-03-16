@@ -178,6 +178,51 @@ std::vector<std::string> extract_json_string_array(const std::string& json, cons
     return result;
 }
 
+std::string extract_json_object(const std::string& json, const std::string& key) {
+    std::string search = "\"" + key + "\"";
+    auto pos = json.find(search);
+    if (pos == std::string::npos) return "";
+
+    pos = json.find(":", pos);
+    if (pos == std::string::npos) return "";
+
+    pos = json.find("{", pos);
+    if (pos == std::string::npos) return "";
+
+    size_t start = pos;
+    int depth = 0;
+    bool in_string = false;
+    bool escape = false;
+
+    for (size_t i = pos; i < json.size(); ++i) {
+        char c = json[i];
+        if (in_string) {
+            if (escape) {
+                escape = false;
+            } else if (c == '\\') {
+                escape = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if (c == '"') {
+            in_string = true;
+            continue;
+        }
+        if (c == '{') {
+            ++depth;
+        } else if (c == '}') {
+            --depth;
+            if (depth == 0) {
+                return json.substr(start, i - start + 1);
+            }
+        }
+    }
+    return "";
+}
+
 }  // namespace
 
 ModelConfig ModelConfig::from_gguf(const std::map<std::string, GGUFMetaData>& meta) {
@@ -252,6 +297,8 @@ ModelConfig ModelConfig::from_hf_json(const std::filesystem::path& config_path) 
         config.architecture = "qwen3_next";
     } else if (config.model_type == "qwen3_moe") {
         config.architecture = "qwen3_moe";
+    } else if (config.model_type == "qwen3_asr_audio_encoder") {
+        config.architecture = "qwen3_asr_audio_encoder";
     }
     
     // Also check model_type for SmolLM3
@@ -263,31 +310,79 @@ ModelConfig ModelConfig::from_hf_json(const std::filesystem::path& config_path) 
         }
     }
     
+    std::string dims_json = json;
+
+    // Qwen3-ASR stores LM dimensions in thinker_config.text_config.
+    if (config.model_type == "qwen3_asr") {
+        config.architecture = "qwen3_asr";
+        auto thinker_json = extract_json_object(json, "thinker_config");
+        if (!thinker_json.empty()) {
+            auto text_json = extract_json_object(thinker_json, "text_config");
+            if (!text_json.empty()) {
+                dims_json = text_json;
+            }
+
+            auto audio_json = extract_json_object(thinker_json, "audio_config");
+            if (!audio_json.empty()) {
+                config.audio_num_mel_bins = extract_json_int(audio_json, "num_mel_bins", 0);
+                config.audio_hidden_size = extract_json_int(audio_json, "d_model", 0);
+                config.audio_intermediate_size = extract_json_int(audio_json, "encoder_ffn_dim", 0);
+                config.audio_num_hidden_layers = extract_json_int(audio_json, "encoder_layers", 0);
+                config.audio_num_attention_heads = extract_json_int(audio_json, "encoder_attention_heads", 0);
+                config.audio_max_position_embeddings = extract_json_int(audio_json, "max_source_positions", 0);
+                config.audio_downsample_hidden_size = extract_json_int(audio_json, "downsample_hidden_size", 0);
+                config.audio_output_dim = extract_json_int(audio_json, "output_dim", 0);
+                config.audio_hidden_act = extract_json_string(audio_json, "activation_function");
+            }
+        }
+    } else if (config.model_type == "qwen3_asr_audio_encoder") {
+        // Audio encoder config uses different field names.
+        // Map to unified ModelConfig dimensions:
+        // hidden_size <- d_model
+        // intermediate_size <- encoder_ffn_dim
+        // num_hidden_layers <- encoder_layers
+        // num_attention_heads <- encoder_attention_heads
+        config.hidden_size = extract_json_int(json, "d_model");
+        config.intermediate_size = extract_json_int(json, "encoder_ffn_dim");
+        config.num_hidden_layers = extract_json_int(json, "encoder_layers");
+        config.num_attention_heads = extract_json_int(json, "encoder_attention_heads");
+        config.num_key_value_heads = config.num_attention_heads;
+        config.head_dim = (config.hidden_size > 0 && config.num_attention_heads > 0)
+            ? (config.hidden_size / config.num_attention_heads)
+            : 0;
+        config.max_position_embeddings = extract_json_int(json, "max_source_positions", 1500);
+        config.hidden_act = extract_json_string(json, "activation_function");
+        if (config.hidden_act.empty()) {
+            config.hidden_act = "gelu";
+        }
+        return config;
+    }
+
     // Dimensions
-    config.hidden_size = extract_json_int(json, "hidden_size");
-    config.intermediate_size = extract_json_int(json, "intermediate_size");
-    config.num_hidden_layers = extract_json_int(json, "num_hidden_layers");
-    config.num_attention_heads = extract_json_int(json, "num_attention_heads");
-    config.num_key_value_heads = extract_json_int(json, "num_key_value_heads", config.num_attention_heads);
-    config.head_dim = extract_json_int(json, "head_dim", 0);
-    config.vocab_size = extract_json_int(json, "vocab_size");
-    config.max_position_embeddings = extract_json_int(json, "max_position_embeddings");
+    config.hidden_size = extract_json_int(dims_json, "hidden_size");
+    config.intermediate_size = extract_json_int(dims_json, "intermediate_size");
+    config.num_hidden_layers = extract_json_int(dims_json, "num_hidden_layers");
+    config.num_attention_heads = extract_json_int(dims_json, "num_attention_heads");
+    config.num_key_value_heads = extract_json_int(dims_json, "num_key_value_heads", config.num_attention_heads);
+    config.head_dim = extract_json_int(dims_json, "head_dim", 0);
+    config.vocab_size = extract_json_int(dims_json, "vocab_size");
+    config.max_position_embeddings = extract_json_int(dims_json, "max_position_embeddings");
 
     // DFlash-specific
     config.block_size = extract_json_int(json, "block_size", 0);
     config.num_target_layers = extract_json_int(json, "num_target_layers", 0);
     
     // Normalization
-    config.rms_norm_eps = extract_json_float(json, "rms_norm_eps", 1e-6f);
+    config.rms_norm_eps = extract_json_float(dims_json, "rms_norm_eps", 1e-6f);
     
     // RoPE
-    config.rope_theta = extract_json_float(json, "rope_theta", 10000.0f);
+    config.rope_theta = extract_json_float(dims_json, "rope_theta", 10000.0f);
     
     // Other
-    config.tie_word_embeddings = extract_json_bool(json, "tie_word_embeddings", false);
-    config.attention_bias = extract_json_bool(json, "attention_bias", false);
-    config.mlp_bias = extract_json_bool(json, "mlp_bias", false);
-    config.hidden_act = extract_json_string(json, "hidden_act");
+    config.tie_word_embeddings = extract_json_bool(dims_json, "tie_word_embeddings", false);
+    config.attention_bias = extract_json_bool(dims_json, "attention_bias", false);
+    config.mlp_bias = extract_json_bool(dims_json, "mlp_bias", false);
+    config.hidden_act = extract_json_string(dims_json, "hidden_act");
     if (config.hidden_act.empty()) {
         config.hidden_act = "silu";
     }

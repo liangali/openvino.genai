@@ -61,10 +61,12 @@ Qwen3Attention::Qwen3Attention(BuilderContext& ctx,
     v_proj_param_ = &register_parameter("v_proj.weight");
     o_proj_param_ = &register_parameter("o_proj.weight");
 
-    q_bias_param_ = &register_parameter("q_proj.bias");
-    k_bias_param_ = &register_parameter("k_proj.bias");
-    v_bias_param_ = &register_parameter("v_proj.bias");
-    o_bias_param_ = &register_parameter("o_proj.bias");
+    if (cfg.attention_bias) {
+        q_bias_param_ = &register_parameter("q_proj.bias");
+        k_bias_param_ = &register_parameter("k_proj.bias");
+        v_bias_param_ = &register_parameter("v_proj.bias");
+        o_bias_param_ = &register_parameter("o_proj.bias");
+    }
 }
 
 const Tensor& Qwen3Attention::q_proj_weight() const {
@@ -317,6 +319,25 @@ Tensor Qwen3Model::forward(const Tensor& input_ids, const Tensor& position_ids, 
     return norm_.forward(hidden_states);
 }
 
+Tensor Qwen3Model::forward_embeds(const Tensor& inputs_embeds,
+                                  const Tensor& position_ids,
+                                  const Tensor& beam_idx,
+                                  const Tensor& attention_mask) {
+    auto hidden_states = inputs_embeds;
+    auto* policy = &ctx().op_policy();
+    auto cos_sin = ops::llm::rope_cos_sin(position_ids, head_dim_, rope_theta_, policy);
+    std::optional<Tensor> residual;
+    for (auto& layer : layers_) {
+        auto layer_out = layer.forward(hidden_states, beam_idx, cos_sin.first, cos_sin.second, attention_mask, residual);
+        hidden_states = layer_out.first;
+        residual = layer_out.second;
+    }
+    if (residual) {
+        return norm_.forward(hidden_states, *residual).first;
+    }
+    return norm_.forward(hidden_states);
+}
+
 std::pair<Tensor, Tensor> Qwen3Model::forward_with_penultimate(const Tensor& input_ids,
                                                                const Tensor& position_ids,
                                                                const Tensor& beam_idx) {
@@ -492,6 +513,14 @@ Tensor Qwen3ForCausalLM::forward(const Tensor& input_ids,
                                  const Tensor& beam_idx,
                                  const Tensor& attention_mask) {
     auto hidden = model_.forward(input_ids, position_ids, beam_idx, attention_mask);
+    return lm_head_.forward(hidden);
+}
+
+Tensor Qwen3ForCausalLM::forward_embeds(const Tensor& inputs_embeds,
+                                        const Tensor& position_ids,
+                                        const Tensor& beam_idx,
+                                        const Tensor& attention_mask) {
+    auto hidden = model_.forward_embeds(inputs_embeds, position_ids, beam_idx, attention_mask);
     return lm_head_.forward(hidden);
 }
 

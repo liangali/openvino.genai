@@ -13,6 +13,7 @@
 #include "modeling/ops/kv_cache.hpp"
 #include "modeling/ops/ops.hpp"
 #include "modeling/ops/shape.hpp"
+#include "modeling/ops/tensor_ops.hpp"
 #include "modeling/weights/weight_loader.hpp"
 #include "modeling/weights/weight_source.hpp"
 
@@ -49,6 +50,31 @@ void load_raw_weight(ov::genai::modeling::WeightParameter& param,
         OPENVINO_THROW("Missing weight tensor: ", weight_name);
     }
     param.bind(ov::genai::modeling::ops::constant(source.get_tensor(weight_name), param.context()));
+}
+
+ov::genai::modeling::Tensor dequantize_packed_moe_weight(const ov::genai::modeling::Tensor& packed_weight,
+                                                          const ov::genai::modeling::Tensor& scales_e_g_o,
+                                                          const ov::genai::modeling::Tensor& zps_e_g_o,
+                                                          int32_t num_experts,
+                                                          int32_t out_features,
+                                                          int32_t in_features) {
+    auto* op_ctx = packed_weight.context();
+
+    // Convert [E, G, O] -> [E, O, G] to align with packed [E, O, G, GS].
+    auto perm = ov::genai::modeling::ops::const_vec(op_ctx, std::vector<int64_t>{0, 2, 1});
+    auto scales_e_o_g = ov::genai::modeling::Tensor(
+        std::make_shared<ov::op::v1::Transpose>(scales_e_g_o.output(), perm),
+        op_ctx);
+    auto zps_e_o_g = ov::genai::modeling::Tensor(
+        std::make_shared<ov::op::v1::Transpose>(zps_e_g_o.output(), perm),
+        op_ctx);
+
+    auto packed_f32 = packed_weight.to(ov::element::f32);
+    auto zps_f32 = zps_e_o_g.unsqueeze(-1).to(ov::element::f32);
+    auto scales_f32 = scales_e_o_g.unsqueeze(-1).to(ov::element::f32);
+    auto dequant_grouped = (packed_f32 - zps_f32) * scales_f32;
+
+    return dequant_grouped.reshape({num_experts, out_features, in_features}, false);
 }
 
 }  // namespace
@@ -192,6 +218,10 @@ Qwen3MoE::Qwen3MoE(BuilderContext& ctx, const std::string& name, const Qwen3MoeC
     }
 
     if (cfg.architecture == "qwen3_moe") {
+        has_gate_quant_ = true;
+        has_up_quant_ = true;
+        has_down_quant_ = true;
+
         gate_exps_param_.resize(num_experts_);
         up_exps_param_.resize(num_experts_);
         down_exps_param_.resize(num_experts_);
@@ -214,19 +244,19 @@ Qwen3MoE::Qwen3MoE(BuilderContext& ctx, const std::string& name, const Qwen3MoeC
                                                    weights::WeightFinalizer& finalizer,
                                                    const std::string& weight_name,
                                                    const std::optional<int>& shard_id) {
-                (void)finalizer;
                 (void)shard_id;
                 if (!param.context()) {
                     OPENVINO_THROW("WeightParameter has no OpContext: ", param.name());
                 }
                 auto weight = finalizer.finalize(weight_name, source, *param.context());
                 param.bind(weight);
-                if (weight.get_auxiliary("scales") == std::nullopt ||
-                    weight.get_auxiliary("zps") == std::nullopt) {
-                    OPENVINO_THROW("Missing MoE quantization params for scales and zps! ");
+                if (weight.get_auxiliary("scales") != std::nullopt &&
+                    weight.get_auxiliary("zps") != std::nullopt) {
+                    gate_exps_scales_[i] = weight.auxiliary.at("scales");
+                    gate_exps_zps_[i] = weight.auxiliary.at("zps");
+                } else {
+                    has_gate_quant_ = false;
                 }
-                gate_exps_scales_[i] = weight.auxiliary.at("scales");
-                gate_exps_zps_[i] = weight.auxiliary.at("zps");
             });
 
             up_exps_param_[i]->set_weight_loader([this, i](WeightParameter& param,
@@ -234,19 +264,19 @@ Qwen3MoE::Qwen3MoE(BuilderContext& ctx, const std::string& name, const Qwen3MoeC
                                                  weights::WeightFinalizer& finalizer,
                                                  const std::string& weight_name,
                                                  const std::optional<int>& shard_id) {
-                (void)finalizer;
                 (void)shard_id;
                 if (!param.context()) {
                     OPENVINO_THROW("WeightParameter has no OpContext: ", param.name());
                 }
                 auto weight = finalizer.finalize(weight_name, source, *param.context());
                 param.bind(weight);
-                if (weight.get_auxiliary("scales") == std::nullopt ||
-                    weight.get_auxiliary("zps") == std::nullopt) {
-                    OPENVINO_THROW("Missing MoE quantization params for scales and zps! ");
+                if (weight.get_auxiliary("scales") != std::nullopt &&
+                    weight.get_auxiliary("zps") != std::nullopt) {
+                    up_exps_scales_[i] = weight.auxiliary.at("scales");
+                    up_exps_zps_[i] = weight.auxiliary.at("zps");
+                } else {
+                    has_up_quant_ = false;
                 }
-                up_exps_scales_[i] = weight.auxiliary.at("scales");
-                up_exps_zps_[i] = weight.auxiliary.at("zps");
             });
 
             down_exps_param_[i]->set_weight_loader([this, i](WeightParameter& param,
@@ -254,22 +284,26 @@ Qwen3MoE::Qwen3MoE(BuilderContext& ctx, const std::string& name, const Qwen3MoeC
                                                    weights::WeightFinalizer& finalizer,
                                                    const std::string& weight_name,
                                                    const std::optional<int>& shard_id) {
-                (void)finalizer;
                 (void)shard_id;
                 if (!param.context()) {
                     OPENVINO_THROW("WeightParameter has no OpContext: ", param.name());
                 }
                 auto weight = finalizer.finalize(weight_name, source, *param.context());
                 param.bind(weight);
-                if (weight.get_auxiliary("scales") == std::nullopt ||
-                    weight.get_auxiliary("zps") == std::nullopt) {
-                    OPENVINO_THROW("Missing MoE quantization params for scales and zps! ");
+                if (weight.get_auxiliary("scales") != std::nullopt &&
+                    weight.get_auxiliary("zps") != std::nullopt) {
+                    down_exps_scales_[i] = weight.auxiliary.at("scales");
+                    down_exps_zps_[i] = weight.auxiliary.at("zps");
+                } else {
+                    has_down_quant_ = false;
                 }
-                down_exps_scales_[i] = weight.auxiliary.at("scales");
-                down_exps_zps_[i] = weight.auxiliary.at("zps");
             });
         }
     } else {
+        has_gate_quant_ = true;
+        has_up_quant_ = true;
+        has_down_quant_ = true;
+
         gate_exps_param_.resize(1);
         up_exps_param_.resize(1);
         down_exps_param_.resize(1);
@@ -295,11 +329,12 @@ Qwen3MoE::Qwen3MoE(BuilderContext& ctx, const std::string& name, const Qwen3MoeC
             const std::string base_key = base_key_from_weight(weight_name);
             const std::string scales_key = base_key + ".scales";
             const std::string zps_key = base_key + ".zps";
-            if (!source.has(scales_key) || !source.has(zps_key)) {
-                OPENVINO_THROW("Missing MoE quantization params for ", base_key);
+            if (source.has(scales_key) && source.has(zps_key)) {
+                gate_exps_scales_[0] = ops::constant(source.get_tensor(scales_key), param.context());
+                gate_exps_zps_[0] = ops::constant(source.get_tensor(zps_key), param.context());
+            } else {
+                has_gate_quant_ = false;
             }
-            gate_exps_scales_[0] = ops::constant(source.get_tensor(scales_key), param.context());
-            gate_exps_zps_[0] = ops::constant(source.get_tensor(zps_key), param.context());
         });
 
         up_exps_param_[0]->set_weight_loader([this](WeightParameter& param,
@@ -313,11 +348,12 @@ Qwen3MoE::Qwen3MoE(BuilderContext& ctx, const std::string& name, const Qwen3MoeC
             const std::string base_key = base_key_from_weight(weight_name);
             const std::string scales_key = base_key + ".scales";
             const std::string zps_key = base_key + ".zps";
-            if (!source.has(scales_key) || !source.has(zps_key)) {
-                OPENVINO_THROW("Missing MoE quantization params for ", base_key);
+            if (source.has(scales_key) && source.has(zps_key)) {
+                up_exps_scales_[0] = ops::constant(source.get_tensor(scales_key), param.context());
+                up_exps_zps_[0] = ops::constant(source.get_tensor(zps_key), param.context());
+            } else {
+                has_up_quant_ = false;
             }
-            up_exps_scales_[0] = ops::constant(source.get_tensor(scales_key), param.context());
-            up_exps_zps_[0] = ops::constant(source.get_tensor(zps_key), param.context());
         });
 
         down_exps_param_[0]->set_weight_loader([this](WeightParameter& param,
@@ -331,11 +367,12 @@ Qwen3MoE::Qwen3MoE(BuilderContext& ctx, const std::string& name, const Qwen3MoeC
             const std::string base_key = base_key_from_weight(weight_name);
             const std::string scales_key = base_key + ".scales";
             const std::string zps_key = base_key + ".zps";
-            if (!source.has(scales_key) || !source.has(zps_key)) {
-                OPENVINO_THROW("Missing MoE quantization params for ", base_key);
+            if (source.has(scales_key) && source.has(zps_key)) {
+                down_exps_scales_[0] = ops::constant(source.get_tensor(scales_key), param.context());
+                down_exps_zps_[0] = ops::constant(source.get_tensor(zps_key), param.context());
+            } else {
+                has_down_quant_ = false;
             }
-            down_exps_scales_[0] = ops::constant(source.get_tensor(scales_key), param.context());
-            down_exps_zps_[0] = ops::constant(source.get_tensor(zps_key), param.context());
         });
     }
 }
@@ -353,8 +390,9 @@ Tensor Qwen3MoE::gate_exps_weight() const {
     }
     std::vector<Tensor> valid;
     valid.reserve(gate_exps_param_.size());
-    for(auto* p : gate_exps_param_) valid.push_back(p->value());
-    if (valid.size() == 1) return valid[0];
+    for (auto* p : gate_exps_param_) {
+        valid.push_back(p->value().unsqueeze(0));
+    }
     auto result = ops::concat(valid, 0);
     result.output().get_node()->get_rt_info()["postponed_constant"] = true;
     return result;
@@ -366,8 +404,9 @@ Tensor Qwen3MoE::up_exps_weight() const {
     }
     std::vector<Tensor> valid;
     valid.reserve(up_exps_param_.size());
-    for(auto* p : up_exps_param_) valid.push_back(p->value());
-    if (valid.size() == 1) return valid[0];
+    for (auto* p : up_exps_param_) {
+        valid.push_back(p->value().unsqueeze(0));
+    }
     auto result = ops::concat(valid, 0);
     result.output().get_node()->get_rt_info()["postponed_constant"] = true;
     return result;
@@ -379,58 +418,103 @@ Tensor Qwen3MoE::down_exps_weight() const {
     }
     std::vector<Tensor> valid;
     valid.reserve(down_exps_param_.size());
-    for(auto* p : down_exps_param_) valid.push_back(p->value());
-    if (valid.size() == 1) return valid[0];
+    for (auto* p : down_exps_param_) {
+        valid.push_back(p->value().unsqueeze(0));
+    }
     auto result = ops::concat(valid, 0);
     result.output().get_node()->get_rt_info()["postponed_constant"] = true;
     return result;
 }
 
 Tensor Qwen3MoE::gate_exps_scales() const {
-    if (gate_exps_scales_.size() == 1) return gate_exps_scales_[0];
-    auto result = ops::concat(gate_exps_scales_, 0);
+    std::vector<Tensor> expanded;
+    expanded.reserve(gate_exps_scales_.size());
+    for (const auto& t : gate_exps_scales_) {
+        expanded.push_back(t.unsqueeze(0));
+    }
+    auto result = ops::concat(expanded, 0);
     result.output().get_node()->get_rt_info()["postponed_constant"] = true;
     return result;
 }
 
 Tensor Qwen3MoE::gate_exps_zps() const {
-    if (gate_exps_zps_.size() == 1) return gate_exps_zps_[0];
-    auto result = ops::concat(gate_exps_zps_, 0);
+    std::vector<Tensor> expanded;
+    expanded.reserve(gate_exps_zps_.size());
+    for (const auto& t : gate_exps_zps_) {
+        expanded.push_back(t.unsqueeze(0));
+    }
+    auto result = ops::concat(expanded, 0);
     result.output().get_node()->get_rt_info()["postponed_constant"] = true;
     return result;
 }
 
 Tensor Qwen3MoE::up_exps_scales() const {
-    if (up_exps_scales_.size() == 1) return up_exps_scales_[0];
-    auto result = ops::concat(up_exps_scales_, 0);
+    std::vector<Tensor> expanded;
+    expanded.reserve(up_exps_scales_.size());
+    for (const auto& t : up_exps_scales_) {
+        expanded.push_back(t.unsqueeze(0));
+    }
+    auto result = ops::concat(expanded, 0);
     result.output().get_node()->get_rt_info()["postponed_constant"] = true;
     return result;
 }
 
 Tensor Qwen3MoE::up_exps_zps() const {
-    if (up_exps_zps_.size() == 1) return up_exps_zps_[0];
-    auto result = ops::concat(up_exps_zps_, 0);
+    std::vector<Tensor> expanded;
+    expanded.reserve(up_exps_zps_.size());
+    for (const auto& t : up_exps_zps_) {
+        expanded.push_back(t.unsqueeze(0));
+    }
+    auto result = ops::concat(expanded, 0);
     result.output().get_node()->get_rt_info()["postponed_constant"] = true;
     return result;
 }
 
 Tensor Qwen3MoE::down_exps_scales() const {
-    if (down_exps_scales_.size() == 1) return down_exps_scales_[0];
-    auto result = ops::concat(down_exps_scales_, 0);
+    std::vector<Tensor> expanded;
+    expanded.reserve(down_exps_scales_.size());
+    for (const auto& t : down_exps_scales_) {
+        expanded.push_back(t.unsqueeze(0));
+    }
+    auto result = ops::concat(expanded, 0);
     result.output().get_node()->get_rt_info()["postponed_constant"] = true;
     return result;
 }
 
 Tensor Qwen3MoE::down_exps_zps() const {
-    if (down_exps_zps_.size() == 1) return down_exps_zps_[0];
-    auto result = ops::concat(down_exps_zps_, 0);
+    std::vector<Tensor> expanded;
+    expanded.reserve(down_exps_zps_.size());
+    for (const auto& t : down_exps_zps_) {
+        expanded.push_back(t.unsqueeze(0));
+    }
+    auto result = ops::concat(expanded, 0);
     result.output().get_node()->get_rt_info()["postponed_constant"] = true;
     return result;
 }
 
-Tensor Qwen3MoE::forward(const Tensor& x) const {
+bool Qwen3MoE::can_use_fused_path() const {
+    if (!(has_gate_quant_ && has_up_quant_ && has_down_quant_)) {
+        return false;
+    }
+
+    // Fused compressed MoE kernel expects packed expert weights.
+    const auto gate_rank = gate_exps_weight().output().get_shape().size();
+    const auto up_rank = up_exps_weight().output().get_shape().size();
+    const auto down_rank = down_exps_weight().output().get_shape().size();
+    return gate_rank == 4 && up_rank == 4 && down_rank == 4;
+}
+
+size_t Qwen3MoE::infer_group_size() const {
+    const auto shape = gate_exps_weight().output().get_shape();
+    if (shape.size() == 4 && shape[3] > 0) {
+        return shape[3];
+    }
+    return group_size_;
+}
+
+Tensor Qwen3MoE::routed_fused(const Tensor& flat_f32) const {
     return ops::moe3gemm_fused_compressed(
-        x,
+        flat_f32,
         gate_inp_weight(),
         gate_exps_weight(),
         gate_exps_scales(),
@@ -445,8 +529,91 @@ Tensor Qwen3MoE::forward(const Tensor& x) const {
         inter_size_,
         num_experts_,
         top_k_,
-        group_size_,
+        infer_group_size(),
         ov::element::f16);
+}
+
+Tensor Qwen3MoE::routed_fallback(const Tensor& flat_f32) const {
+    auto* op_ctx = flat_f32.context();
+
+    auto logits = ops::linear(flat_f32, gate_inp_weight().to(ov::element::f32));
+    auto scores = logits.softmax(1);
+
+    auto k_node = ops::const_scalar(op_ctx, static_cast<int64_t>(top_k_));
+    auto topk = std::make_shared<ov::op::v11::TopK>(scores.output(),
+                                                    k_node,
+                                                    -1,
+                                                    ov::op::v11::TopK::Mode::MAX,
+                                                    ov::op::v11::TopK::SortType::SORT_VALUES,
+                                                    ov::element::i64);
+
+    Tensor topk_vals(topk->output(0), op_ctx);
+    Tensor topk_idx(topk->output(1), op_ctx);
+
+    auto zeros = shape::broadcast_to(Tensor(ops::const_scalar(op_ctx, 0.0f), op_ctx), shape::of(scores));
+    auto scatter_axis = ops::const_scalar(op_ctx, static_cast<int64_t>(1));
+    auto scatter = std::make_shared<ov::op::v12::ScatterElementsUpdate>(zeros.output(),
+                                                                         topk_idx.output(),
+                                                                         topk_vals.output(),
+                                                                         scatter_axis);
+    Tensor routing(scatter, op_ctx);  // [T, E]
+    auto perm = ops::const_vec(op_ctx, std::vector<int64_t>{1, 0});
+    auto routing_t = Tensor(std::make_shared<ov::op::v1::Transpose>(routing.output(), perm), op_ctx);
+    auto routing_3d = routing_t.unsqueeze(-1);  // [E, T, 1]
+
+    auto flat_3d = flat_f32.unsqueeze(0);
+    auto tiled = ops::tensor::tile(flat_3d, {num_experts_, 1, 1});  // [E, T, H]
+
+    Tensor gate_w;
+    Tensor up_w;
+    Tensor down_w;
+
+    if (has_gate_quant_ && gate_exps_weight().output().get_shape().size() == 4) {
+        gate_w = dequantize_packed_moe_weight(gate_exps_weight(),
+                                              gate_exps_scales(),
+                                              gate_exps_zps(),
+                                              num_experts_,
+                                              inter_size_,
+                                              hidden_size_);
+        up_w = dequantize_packed_moe_weight(up_exps_weight(),
+                                            up_exps_scales(),
+                                            up_exps_zps(),
+                                            num_experts_,
+                                            inter_size_,
+                                            hidden_size_);
+    } else {
+        gate_w = gate_exps_weight().to(ov::element::f32);
+        up_w = up_exps_weight().to(ov::element::f32);
+    }
+
+    if (has_down_quant_ && down_exps_weight().output().get_shape().size() == 4) {
+        down_w = dequantize_packed_moe_weight(down_exps_weight(),
+                                              down_exps_scales(),
+                                              down_exps_zps(),
+                                              num_experts_,
+                                              hidden_size_,
+                                              inter_size_);
+    } else {
+        down_w = down_exps_weight().to(ov::element::f32);
+    }
+
+    auto gate_bmm = ops::matmul(tiled, gate_w, false, true);
+    auto up_bmm = ops::matmul(tiled, up_w, false, true);
+    auto swiglu = ops::silu(gate_bmm) * up_bmm;
+    auto down_bmm = ops::matmul(swiglu, down_w, false, true);
+
+    auto weighted = down_bmm.to(ov::element::f32) * routing_3d;
+    auto reduce_axis = ops::const_vec(op_ctx, std::vector<int64_t>{0});
+    auto reduced = std::make_shared<ov::op::v1::ReduceSum>(weighted.output(), reduce_axis, false);
+    return Tensor(reduced, op_ctx);
+}
+
+Tensor Qwen3MoE::forward(const Tensor& x) const {
+    auto flat = x.reshape({-1, hidden_size_});
+    auto flat_f32 = flat.to(ov::element::f32);
+    auto routed = can_use_fused_path() ? routed_fused(flat_f32) : routed_fallback(flat_f32);
+    auto restored = routed.reshape(shape::of(x), false);
+    return restored.to(x.dtype());
 }
 
 Qwen3MoeDecoderLayer::Qwen3MoeDecoderLayer(BuilderContext& ctx,

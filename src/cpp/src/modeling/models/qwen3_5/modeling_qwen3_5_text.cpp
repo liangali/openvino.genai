@@ -521,20 +521,22 @@ Tensor Qwen3_5GatedDeltaNet::forward(const Tensor& hidden_states,
                                               ov::element::f32,
                                               state_prefix + ".recurrent"};
     auto recurrent_var = std::make_shared<ov::op::util::Variable>(recurrent_info);
-    auto recurrent_read = std::make_shared<ov::op::v6::ReadValue>(recurrent_init.output(), recurrent_var);
-    auto recurrent_cached = ops::gather(Tensor(recurrent_read->output(0), op_ctx), beam_idx, 0);
 
     Tensor core_attn_tensor;  // [B, S, num_v_heads, head_v_dim]
 
     if (use_linear_attention_op()) {
-        // ── Fused LinearAttention op path ──
-        auto la_result = ops::linear_attention(q_heads, k_heads, v_heads, beta, g, recurrent_cached);
+        // ── Fused LinearAttention op path (mirrors FusedConv pattern) ──
+        // No ReadValue/Assign — LinearAttention manages the variable exclusively.
+        // The GPU impl reads from variable memory (if set) or from recurrent_init (first iteration),
+        // and writes updated state directly to variable memory.
+        auto la_result = ops::linear_attention(q_f32, k_f32, v_f32, beta, g, recurrent_init, recurrent_var);
         core_attn_tensor = la_result.first;   // [B, S, num_v_heads, head_v_dim]
-        auto recurrent_final = la_result.second;  // [B, num_v_heads, head_k_dim, head_v_dim]
-        auto recurrent_assign = std::make_shared<ov::opset13::Assign>(recurrent_final.output(), recurrent_var);
-        ctx().register_sink(recurrent_assign);
     } else {
         // ── TensorIterator path (default) ──
+        // Traditional ReadValue + Gather + Assign pattern for variable state management.
+        auto recurrent_read = std::make_shared<ov::op::v6::ReadValue>(recurrent_init.output(), recurrent_var);
+        auto recurrent_cached = ops::gather(Tensor(recurrent_read->output(0), op_ctx), beam_idx, 0);
+
         auto q_ss = Tensor(std::make_shared<ov::op::v1::ReduceSum>(q_f32.pow(2.0f).output(), reduce_kdim, true), op_ctx);
         auto k_ss = Tensor(std::make_shared<ov::op::v1::ReduceSum>(k_f32.pow(2.0f).output(), reduce_kdim, true), op_ctx);
         auto q_normed = q_f32 * (q_ss + 1e-6f).rsqrt();

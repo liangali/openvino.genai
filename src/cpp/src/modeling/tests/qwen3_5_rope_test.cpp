@@ -85,6 +85,7 @@ TEST(Qwen3_5Config, AllowsExplicitHeadDimWhenHiddenSizeNotDivisibleByHeads) {
              {"num_attention_heads", 8},
              {"num_key_value_heads", 2},
              {"head_dim", 4},
+             {"partial_rotary_factor", 0.5},
              {"max_position_embeddings", 1024},
              {"rms_norm_eps", 1e-6},
          }},
