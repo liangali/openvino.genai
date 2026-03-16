@@ -430,8 +430,11 @@ Tensor sdpa(const Tensor& q,
             q.output(), k.output(), v.output(), mask->output(), scale_const, causal);
         return Tensor(sdpa_node, ctx);
     } else {
+        // No mask: use 3-input (Q, K, V, is_causal) constructor.
+        // The 4-input constructor treats the 4th arg as a mask, NOT scale.
+        // GPU plugin default scale = 1/sqrt(k_head_size), which matches our scale.
         auto sdpa_node = std::make_shared<ov::op::v13::ScaledDotProductAttention>(
-            q.output(), k.output(), v.output(), scale_const, causal);
+            q.output(), k.output(), v.output(), causal);
         return Tensor(sdpa_node, ctx);
     }
 }
