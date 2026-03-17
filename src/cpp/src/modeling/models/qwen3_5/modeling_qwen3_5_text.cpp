@@ -530,7 +530,6 @@ Tensor Qwen3_5GatedDeltaNet::forward(const Tensor& hidden_states,
         // The GPU impl reads from variable memory (if set) or from recurrent_init (first iteration),
         // and writes updated state directly to variable memory.
         auto la_result = ops::linear_attention(q_heads, k_heads, v_heads, beta, g, recurrent_init, recurrent_var);
-)
         core_attn_tensor = la_result.first;   // [B, S, num_v_heads, head_v_dim]
     } else {
         // ── TensorIterator path (default) ──
