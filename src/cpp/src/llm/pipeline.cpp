@@ -15,6 +15,7 @@
 #include "speculative_decoding/eagle3_model_transforms.hpp"
 #include "speculative_decoding/stateful/eagle3_strategy.hpp"
 #include "speculative_decoding/stateful/fast_draft_strategy.hpp"
+#include "speculative_decoding/stateful/dflash_strategy.hpp"
 #include "utils.hpp"
 
 namespace {
@@ -173,6 +174,17 @@ std::pair<std::string, Any> draft_model(
     return { utils::DRAFT_MODEL_ARG_NAME, Any::make<ModelDesc>(model, tokenizer, device, plugin_config, scheduler_config, generation_config) };
 }
 
+std::pair<std::string, Any> dflash_model(
+    const std::filesystem::path& draft_model_path,
+    const std::string& device,
+    const ov::AnyMap& properties) {
+    utils::DFlashModelConfig cfg;
+    cfg.draft_model_path = draft_model_path;
+    cfg.device = device;
+    cfg.properties = properties;
+    return { utils::DFLASH_MODEL_ARG_NAME, Any::make<utils::DFlashModelConfig>(cfg) };
+}
+
 class StatefulPipeline {
 public:
 static std::unique_ptr<LLMPipelineImplBase> create(
@@ -203,9 +215,16 @@ static std::unique_ptr<LLMPipelineImplBase> create(const std::shared_ptr<ov::Mod
                                                    const std::filesystem::path& models_path = {}) {
     auto properties_without_draft_model = properties;
     auto draft_model_descr = ov::genai::utils::extract_draft_model_from_config(properties_without_draft_model);
+    auto dflash_cfg = ov::genai::utils::extract_dflash_model_from_config(properties_without_draft_model);
 
     auto main_model_descr =
         ov::genai::ModelDesc(model, tokenizer, device, properties_without_draft_model, {}, generation_config);
+
+    // DFlash speculative decoding: takes priority over standard draft_model
+    if (!dflash_cfg.draft_model_path.empty()) {
+        return std::make_unique<StatefulDFlashPipeline>(
+            main_model_descr, dflash_cfg, models_path);
+    }
 
     if (draft_model_descr.model != nullptr) {
         // FIXME: Add support for StatefulSpeculativeLLMPipeline for non-NPU devices for both models.
@@ -260,7 +279,10 @@ ov::genai::LLMPipeline::LLMPipeline(
     bool is_npu_requested = ov::genai::utils::is_npu_requested(device, user_properties);
     auto [properties, attention_backend] = utils::extract_attention_backend(user_properties, is_npu_requested);
 
-    if (is_npu_requested) {
+    // DFlash speculative decoding: always route through StatefulPipeline::create
+    if (properties.count(utils::DFLASH_MODEL_ARG_NAME)) {
+        m_pimpl = StatefulPipeline::create(models_path, tokenizer, device, properties);
+    } else if (is_npu_requested) {
         m_pimpl = StatefulPipeline::create(models_path, tokenizer, device, properties);
     } else if (utils::explicitly_requires_paged_attention(user_properties)) {
         // If CB is invoked explicitly, create CB adapter as is and re-throw in case if internal issues
@@ -298,7 +320,10 @@ ov::genai::LLMPipeline::LLMPipeline(
     bool is_npu_requested = ov::genai::utils::is_npu_requested(device, user_properties);
     auto [properties, attention_backend] = utils::extract_attention_backend(user_properties, is_npu_requested);
 
-    if (is_npu_requested) {
+    // DFlash speculative decoding: always route through StatefulPipeline::create
+    if (properties.count(utils::DFLASH_MODEL_ARG_NAME)) {
+        m_pimpl = StatefulPipeline::create(models_path, device, properties);
+    } else if (is_npu_requested) {
         m_pimpl = StatefulPipeline::create(models_path, device, properties);
     } else if (utils::explicitly_requires_paged_attention(user_properties)) {
         // If CB is invoked explicitly, create CB adapter as is and re-throw in case if internal issues

@@ -254,6 +254,15 @@ public:
 
     VocabEmbedding& embed_tokens();
 
+    std::pair<Tensor, Tensor> forward_with_selected_layers(
+        const Tensor& input_ids,
+        const Tensor& position_ids,
+        const Tensor& beam_idx,
+        const Tensor& full_attention_mask,
+        const Tensor* linear_attention_mask,
+        const Tensor* cache_position,
+        const std::vector<int32_t>& layer_ids);
+
 private:
     Tensor forward_impl(const Tensor* input_ids,
                         const Tensor* inputs_embeds,
@@ -297,6 +306,9 @@ public:
                           const Tensor* visual_embeds = nullptr,
                           const Tensor* visual_pos_mask = nullptr);
 
+    Qwen3_5Model& model() { return model_; }
+    LMHead& lm_head() { return lm_head_; }
+
 private:
     Qwen3_5TextModelConfig cfg_;
     Qwen3_5Model model_;
@@ -309,6 +321,23 @@ std::shared_ptr<ov::Model> create_qwen3_5_text_model(
     ov::genai::modeling::weights::WeightFinalizer& finalizer,
     bool use_inputs_embeds = false,
     bool enable_visual_inputs = true);
+
+std::shared_ptr<ov::Model> create_qwen3_5_dflash_target_model(
+    const Qwen3_5Config& cfg,
+    const std::vector<int32_t>& target_layer_ids,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer);
+
+std::shared_ptr<ov::Model> create_qwen3_5_embedding_model(
+    const Qwen3_5Config& cfg,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer);
+
+std::shared_ptr<ov::Model> create_qwen3_5_lm_head_model(
+    const Qwen3_5Config& cfg,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer,
+    const ov::element::Type& input_type = ov::element::f32);
 
 }  // namespace models
 }  // namespace modeling

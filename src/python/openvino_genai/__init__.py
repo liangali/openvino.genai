@@ -48,6 +48,7 @@ from .py_openvino_genai import (
 from .py_openvino_genai import (
     LLMPipeline,
     draft_model,
+    dflash_model,
 )
 
 # LoRA

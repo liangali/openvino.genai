@@ -105,6 +105,7 @@ void read_anymap_param(const ov::AnyMap& config_map, const std::string& name, T&
 const std::string STREAMER_ARG_NAME = "streamer";
 const std::string CONFIG_ARG_NAME = "generation_config";
 const std::string DRAFT_MODEL_ARG_NAME = "draft_model";
+const std::string DFLASH_MODEL_ARG_NAME = "dflash_model";
 
 template<typename Config = ov::genai::GenerationConfig>
 Config from_config_json_if_exists(const std::filesystem::path& models_path, const char config_name[] = "generation_config.json") {
@@ -124,6 +125,15 @@ ProcessorConfig from_any_map(
 ov::genai::ModelDesc get_draft_model_from_config(const ov::AnyMap& config);
 
 ov::genai::ModelDesc extract_draft_model_from_config(ov::AnyMap& config);
+
+// DFlash model config — stored as simple (path, device) pair in AnyMap.
+struct DFlashModelConfig {
+    std::filesystem::path draft_model_path;
+    std::string device;
+    ov::AnyMap properties;
+};
+
+DFlashModelConfig extract_dflash_model_from_config(ov::AnyMap& config);
 
 bool is_npu_requested(const std::string& device, const ov::AnyMap& properties);
 

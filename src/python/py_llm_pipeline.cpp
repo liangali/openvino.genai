@@ -24,6 +24,7 @@ using ov::genai::StreamerVariant;
 using ov::genai::DecodedResults;
 using ov::genai::Tokenizer;
 using ov::genai::draft_model;
+using ov::genai::dflash_model;
 using ov::genai::ChatHistory;
 
 namespace {
@@ -257,4 +258,15 @@ void init_llm_pipeline(py::module_& m) {
         },
         py::arg("models_path"), "folder with openvino_model.xml and openvino_tokenizer[detokenizer].xml files",
         py::arg("device") = "", "device on which inference will be performed");
+
+    m.def("dflash_model", [](
+            const std::filesystem::path& draft_model_path,
+            const std::string& device,
+            const py::kwargs& kwargs
+        ) {
+            ScopedVar env_manager(pyutils::ov_tokenizers_module_path());
+            return dflash_model(draft_model_path, device, pyutils::kwargs_to_any_map(kwargs)).second;
+        },
+        py::arg("draft_model_path"), "folder with DFlash draft model safetensors",
+        py::arg("device") = "", "device on which DFlash inference will be performed");
 }

@@ -265,6 +265,15 @@ ov::genai::ModelDesc extract_draft_model_from_config(ov::AnyMap& config) {
     return draft_model;
 }
 
+DFlashModelConfig extract_dflash_model_from_config(ov::AnyMap& config) {
+    DFlashModelConfig dflash_cfg;
+    if (config.find(ov::genai::utils::DFLASH_MODEL_ARG_NAME) != config.end()) {
+        dflash_cfg = config.at(ov::genai::utils::DFLASH_MODEL_ARG_NAME).as<DFlashModelConfig>();
+        config.erase(ov::genai::utils::DFLASH_MODEL_ARG_NAME);
+    }
+    return dflash_cfg;
+}
+
 bool is_npu_requested(const std::string& device, const ov::AnyMap& properties) {
     if (device == "NPU") {
         return true;

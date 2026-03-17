@@ -359,6 +359,18 @@ OPENVINO_GENAI_EXPORTS std::pair<std::string, Any> draft_model(
     const std::string& device = {},
     const ov::AnyMap& properties = {});
 
+/**
+ * @brief Creates a DFlash speculative decoding draft model descriptor.
+ * @param draft_model_path Directory with DFlash draft model safetensors weights and config.json.
+ * @param device Device on which inference will be performed.
+ * @param properties Additional configuration properties.
+ * @return A pair {"dflash_model", Any(path_string)} that can be passed as kwarg to LLMPipeline.
+ */
+OPENVINO_GENAI_EXPORTS std::pair<std::string, Any> dflash_model(
+    const std::filesystem::path& draft_model_path,
+    const std::string& device = {},
+    const ov::AnyMap& properties = {});
+
 template <typename... Properties,
           typename std::enable_if<ov::util::StringAny<Properties...>::value, bool>::type = true>
 inline std::pair<std::string, Any> draft_model(
