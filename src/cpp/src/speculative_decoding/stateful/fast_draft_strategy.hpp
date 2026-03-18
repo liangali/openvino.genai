@@ -1,6 +1,8 @@
 // Copyright (C) 2025-2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
+#pragma once
+
 #include "sampling/sampler.hpp"
 #include "utils.hpp"
 #include "openvino/genai/perf_metrics.hpp"
@@ -47,6 +49,7 @@ public:
     void release_memory();
 
     const ov::InferRequest& get_infer_request() const { return m_request; }
+    ov::InferRequest& get_infer_request() { return m_request; }
 
 public:
     ov::genai::RawPerfMetrics raw_perf_metrics;

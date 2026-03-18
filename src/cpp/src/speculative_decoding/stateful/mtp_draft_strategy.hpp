@@ -23,7 +23,7 @@ namespace genai {
 class MtpDraftRunner {
 public:
     MtpDraftRunner(ov::InferRequest mtp_request,
-                   const LLMInferWrapper& main_runner);
+                   LLMInferWrapper& main_runner);
 
     // Draft one token. Returns argmax of MTP logits.
     int64_t infer_next(int64_t prev_token_id, int64_t position);
@@ -38,7 +38,7 @@ public:
 
 private:
     ov::InferRequest          mtp_runner_;
-    const LLMInferWrapper&    main_runner_ref_;
+    LLMInferWrapper&          main_runner_ref_;
     ov::genai::utils::KVAxesPosition kv_pos_;
 
     ov::Tensor input_ids_buf_;

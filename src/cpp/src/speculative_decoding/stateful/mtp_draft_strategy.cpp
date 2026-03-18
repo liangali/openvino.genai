@@ -28,7 +28,7 @@ namespace genai {
 // ── MtpDraftRunner ───────────────────────────────────────────────────────────
 
 MtpDraftRunner::MtpDraftRunner(ov::InferRequest mtp_request,
-                               const LLMInferWrapper& main_runner)
+                               LLMInferWrapper& main_runner)
     : mtp_runner_(std::move(mtp_request)),
       main_runner_ref_(main_runner) {
     // Get KV cache axis positions from the MTP model's runtime model

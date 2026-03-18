@@ -15,6 +15,9 @@
 #include "speculative_decoding/eagle3_model_transforms.hpp"
 #include "speculative_decoding/stateful/eagle3_strategy.hpp"
 #include "speculative_decoding/stateful/fast_draft_strategy.hpp"
+#include "speculative_decoding/stateful/mtp_draft_strategy.hpp"
+#include "modeling/models/qwen3_5/modeling_qwen3_5_mtp.hpp"
+#include "loaders/loaders.hpp"
 #include "utils.hpp"
 
 namespace {
@@ -180,6 +183,46 @@ static std::unique_ptr<LLMPipelineImplBase> create(
     const ov::genai::Tokenizer& tokenizer,
     const std::string& device,
     const ov::AnyMap& properties) {
+    // MTP speculative decoding: uses the model's built-in MTP head.
+    // Enabled when config.json has mtp_num_hidden_layers > 0.
+    // Does NOT require NPU.
+    auto config_path = models_path / "config.json";
+    if (std::filesystem::is_directory(models_path) && std::filesystem::exists(config_path)) {
+        try {
+            auto qwen35_cfg = ov::genai::modeling::models::Qwen3_5Config::from_json_file(models_path);
+            if (qwen35_cfg.text.mtp_num_hidden_layers > 0) {
+                // Use the loader registry to create weight source and finalizer.
+                auto& registry = ov::genai::loaders::LoaderRegistry::instance();
+                auto loader = registry.get_loader_for_path(models_path);
+                auto loader_config = loader->load_config(models_path.string());
+                auto source = loader->create_weight_source(models_path.string());
+                auto finalizer = loader->create_weight_finalizer(loader_config);
+
+                // Build main model with hidden_states output enabled.
+                auto main_ov_model = ov::genai::modeling::models::create_qwen3_5_text_model(
+                    qwen35_cfg, *source, *finalizer,
+                    false, false, true);
+
+                auto generation_config = utils::from_config_json_if_exists(models_path);
+                auto main_model_desc = ov::genai::ModelDesc(
+                    main_ov_model, tokenizer, device, properties, {}, generation_config);
+
+                // Rebuild source/finalizer for MTP model (weights may have been consumed).
+                auto source2 = loader->create_weight_source(models_path.string());
+                auto finalizer2 = loader->create_weight_finalizer(loader_config);
+
+                // Build MTP draft model.
+                auto mtp_ov_model = ov::genai::modeling::models::create_qwen3_5_mtp_model(
+                    qwen35_cfg, *source2, *finalizer2);
+
+                return std::make_unique<MtpSpeculativeLLMPipeline>(
+                    main_model_desc, mtp_ov_model, device, properties);
+            }
+        } catch (...) {
+            // Not a Qwen3.5 model or config parse failed — fall through to default path.
+        }
+    }
+
     return create(ov::genai::utils::read_model(models_path, properties),
                   tokenizer,
                   device,
