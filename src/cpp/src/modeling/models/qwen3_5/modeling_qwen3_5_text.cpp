@@ -972,7 +972,8 @@ std::shared_ptr<ov::Model> create_qwen3_5_text_model(
     ov::genai::modeling::weights::WeightSource& source,
     ov::genai::modeling::weights::WeightFinalizer& finalizer,
     bool use_inputs_embeds,
-    bool enable_visual_inputs) {
+    bool enable_visual_inputs,
+    bool output_hidden_states) {
     Qwen3_5TextModelConfig text_cfg;
     text_cfg.architecture = "qwen3_5";
     text_cfg.hidden_size = cfg.text.hidden_size;
@@ -1056,23 +1057,37 @@ std::shared_ptr<ov::Model> create_qwen3_5_text_model(
         visual_pos_mask_ptr = &visual_pos_mask;
     }
 
-    Tensor logits;
-    if (use_inputs_embeds) {
-        logits = model.forward_embeds(inputs_embeds,
-                                      position_ids,
-                                      beam_idx,
-                                      attention_mask,
-                                      &attention_mask,
-                                      nullptr,
-                                      visual_embeds_ptr,
-                                      visual_pos_mask_ptr);
-    } else {
-        logits = model.forward(input_ids, position_ids, beam_idx, attention_mask, &attention_mask, nullptr, visual_embeds_ptr, visual_pos_mask_ptr);
-    }
+    OPENVINO_ASSERT(!use_inputs_embeds || !output_hidden_states,
+        "output_hidden_states=true is not supported with use_inputs_embeds=true");
 
-    auto result = std::make_shared<ov::op::v0::Result>(logits.output());
-    set_name(result, Qwen3_5TextIO::kLogits);
-    auto ov_model = ctx.build_model({result->output(0)});
+    std::shared_ptr<ov::Model> ov_model;
+    if (use_inputs_embeds) {
+        auto logits = model.forward_embeds(inputs_embeds,
+                                           position_ids,
+                                           beam_idx,
+                                           attention_mask,
+                                           &attention_mask,
+                                           nullptr,
+                                           visual_embeds_ptr,
+                                           visual_pos_mask_ptr);
+        auto result = std::make_shared<ov::op::v0::Result>(logits.output());
+        set_name(result, Qwen3_5TextIO::kLogits);
+        ov_model = ctx.build_model({result->output(0)});
+    } else if (output_hidden_states) {
+        auto [logits_hs, last_hidden] = model.forward_with_hidden(
+            input_ids, position_ids, beam_idx, attention_mask, &attention_mask, nullptr,
+            visual_embeds_ptr, visual_pos_mask_ptr);
+        auto logits_result = std::make_shared<ov::op::v0::Result>(logits_hs.output());
+        set_name(logits_result, Qwen3_5TextIO::kLogits);
+        auto hidden_result = std::make_shared<ov::op::v0::Result>(last_hidden.output());
+        set_name(hidden_result, "hidden_states");
+        ov_model = ctx.build_model({logits_result->output(0), hidden_result->output(0)});
+    } else {
+        auto logits = model.forward(input_ids, position_ids, beam_idx, attention_mask, &attention_mask, nullptr, visual_embeds_ptr, visual_pos_mask_ptr);
+        auto result = std::make_shared<ov::op::v0::Result>(logits.output());
+        set_name(result, Qwen3_5TextIO::kLogits);
+        ov_model = ctx.build_model({result->output(0)});
+    }
     ov_model->set_rt_info(ov::element::f16, {"runtime_options", ov::hint::kv_cache_precision.name()});
     ov_model->set_rt_info(8.0f, {"runtime_options", ov::hint::activations_scale_factor.name()});
     return ov_model;

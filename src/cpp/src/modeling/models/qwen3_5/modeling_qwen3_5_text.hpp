@@ -322,7 +322,8 @@ std::shared_ptr<ov::Model> create_qwen3_5_text_model(
     ov::genai::modeling::weights::WeightSource& source,
     ov::genai::modeling::weights::WeightFinalizer& finalizer,
     bool use_inputs_embeds = false,
-    bool enable_visual_inputs = true);
+    bool enable_visual_inputs = true,
+    bool output_hidden_states = false);
 
 }  // namespace models
 }  // namespace modeling
