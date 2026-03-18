@@ -18,6 +18,14 @@ class LLMInferWrapper {
 public:
     LLMInferWrapper(const ov::genai::ModelDesc& model_desc);
 
+    // Construct from a pre-compiled InferRequest (avoids re-compilation).
+    // Use when the model has already been compiled and the OV graph is no longer needed.
+    LLMInferWrapper(ov::InferRequest request,
+                    const std::string& device,
+                    const ov::AnyMap& properties,
+                    const ov::genai::GenerationConfig& generation_config,
+                    const ov::genai::Tokenizer& tokenizer);
+
     std::string device() const;
 
     ov::genai::GenerationConfig get_generation_config() const;
@@ -75,6 +83,9 @@ private:
     int64_t last_token = -1;
     ov::genai::utils::KVAxesPosition m_kv_pos;
     ov::InferRequest m_request;
+
+    // True when the model expects 3D MRoPE position_ids [3, B, S] instead of 2D [B, S].
+    bool m_is_mrope = false;
 
     // Data placeholder for 1-token inference:
     int64_t m_new_input_token = -1;

@@ -46,6 +46,12 @@ Qwen3_5MtpForDraft::Qwen3_5MtpForDraft(BuilderContext& ctx,
       lm_head_(ctx, "lm_head", this) {
     fc_param_ = &register_parameter("fc.weight");
 
+    // Tie lm_head weight to embed_tokens weight when tie_word_embeddings=true.
+    // Must be done at construction time so load_model() binds both via the embed key.
+    if (cfg_.tie_word_embeddings) {
+        lm_head_.tie_to(embed_tokens_.weight_param());
+    }
+
     // Compute rotary_dim the same way as Qwen3_5Model does.
     const int32_t head_dim = cfg_.head_dim > 0
                                  ? cfg_.head_dim
@@ -68,12 +74,17 @@ Tensor Qwen3_5MtpForDraft::forward(const Tensor& input_ids,
     auto embed = embed_tokens_.forward(input_ids);
 
     // 2. Normalize embedding and hidden state independently
-    auto e_norm = pre_fc_norm_embed_.forward(embed);
+    // Cast embed to hidden_states dtype to ensure type consistency
+    // (embed weights may be bf16 while hidden_states is f16, or vice versa)
+    auto embed_cast = embed.to(hidden_states.dtype());
+    auto e_norm = pre_fc_norm_embed_.forward(embed_cast);
     auto h_norm = pre_fc_norm_hidden_.forward(hidden_states);
 
     // 3. Fuse: concat along feature axis -> [B, 1, 2H], then project -> [B, 1, H]
     auto fused     = ops::concat({e_norm, h_norm}, /*axis=*/-1);
-    auto projected = ops::linear(fused, fc_param_->value());
+    // Cast FC weight to match fused dtype
+    auto fc_w = fc_param_->value().to(fused.dtype());
+    auto projected = ops::linear(fused, fc_w);
 
     // 4. Compute 1D RoPE cos/sin tables.
     //    position_ids shape: [B, 1]  (simple 1-D, not MRoPE 3-D)
@@ -175,7 +186,9 @@ std::shared_ptr<ov::Model> create_qwen3_5_mtp_model(
                                        ov::PartialShape{-1, -1});
     auto position_ids = ctx.parameter("position_ids",  ov::element::i64,
                                        ov::PartialShape{-1, -1});
-    auto hidden_in    = ctx.parameter("hidden_states",  ov::element::f16,
+    // Use f32 element type — the safetensors weight finalizer converts all BF16/F16
+    // weights to F32, so the main model runs in F32 and outputs F32 hidden_states.
+    auto hidden_in    = ctx.parameter("hidden_states",  ov::element::f32,
                                        ov::PartialShape{-1, -1, model_cfg.hidden_size});
     auto beam_idx     = ctx.parameter("beam_idx",       ov::element::i32,
                                        ov::PartialShape{-1});

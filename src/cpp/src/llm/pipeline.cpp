@@ -79,6 +79,82 @@ bool can_try_auto_pa_backend(const std::filesystem::path& models_path) {
     return false;
 }
 
+// Try to create an MTP speculative pipeline for Qwen3.5 models.
+// Returns nullptr if not applicable (not a Qwen3.5 MTP model, or creation fails).
+std::unique_ptr<ov::genai::LLMPipelineImplBase> try_create_mtp_pipeline(
+    const std::filesystem::path& models_path,
+    const ov::genai::Tokenizer& tokenizer,
+    const std::string& device,
+    const ov::AnyMap& properties) {
+    using namespace ov::genai::modeling::models;
+    auto config_path = models_path / "config.json";
+    if (!std::filesystem::is_directory(models_path) || !std::filesystem::exists(config_path)) {
+        return nullptr;
+    }
+    try {
+        auto qwen35_cfg = Qwen3_5Config::from_json_file(models_path);
+        if (qwen35_cfg.text.mtp_num_hidden_layers <= 0) {
+            return nullptr;
+        }
+        // Extract quantization config and compile-safe properties from user properties first,
+        // so they can be injected into the loader config before weight finalization.
+        auto [props_no_quant, quant_cfg] = ov::genai::utils::extract_quantization_config(properties);
+        auto [compile_props, _gguf]      = ov::genai::utils::extract_gguf_properties(props_no_quant);
+
+        std::cerr << "[MTP] Building main model..." << std::endl;
+        auto& registry  = ov::genai::loaders::LoaderRegistry::instance();
+        auto loader      = registry.get_loader_for_path(models_path);
+        auto loader_config = loader->load_config(models_path.string());
+        // Inject runtime quantization config (e.g. int4_asym) so the weight finalizer
+        // applies the correct quantization instead of falling back to F32.
+        if (quant_cfg.has_value() && !loader_config.quantization_config.has_value()) {
+            loader_config.quantization_config = quant_cfg;
+        }
+        auto source      = loader->create_weight_source(models_path.string());
+        auto finalizer   = loader->create_weight_finalizer(loader_config);
+
+        auto main_ov_model = create_qwen3_5_text_model(
+            qwen35_cfg, *source, *finalizer, false, false, true);
+        std::cerr << "[MTP] Main model built OK" << std::endl;
+
+        auto generation_config = ov::genai::utils::from_config_json_if_exists(models_path);
+
+        // Compile the main model immediately and release the OV graph to free weight constants.
+        // This is critical for large models (e.g. 35B) where holding both the main OV graph
+        // and the MTP OV graph simultaneously would exceed available system RAM.
+        std::cerr << "[MTP] Compiling main model (to free OV graph before MTP load)..." << std::endl;
+        auto main_compiled = ov::genai::utils::singleton_core().compile_model(
+            main_ov_model, device.empty() ? "" : device, compile_props);
+        auto main_request = main_compiled.create_infer_request();
+        main_ov_model.reset();   // free weight constants now that compilation is done
+        std::cerr << "[MTP] Main model compiled OK" << std::endl;
+
+        auto main_runner = std::make_unique<ov::genai::LLMInferWrapper>(
+            std::move(main_request), device, compile_props, generation_config, tokenizer);
+
+        // MTP model is always built in F32 (no quantization).
+        // Use a fresh loader_config without quantization to avoid quantizing MTP weights.
+        std::cerr << "[MTP] Building MTP draft model..." << std::endl;
+        auto mtp_loader_config = loader->load_config(models_path.string());
+        auto source2    = loader->create_weight_source(models_path.string());
+        auto finalizer2 = loader->create_weight_finalizer(mtp_loader_config);
+        auto mtp_ov_model = create_qwen3_5_mtp_model(qwen35_cfg, *source2, *finalizer2);
+        std::cerr << "[MTP] MTP model built OK" << std::endl;
+
+        auto mtp_pipe = std::make_unique<ov::genai::MtpSpeculativeLLMPipeline>(
+            std::move(main_runner), mtp_ov_model, device, compile_props, tokenizer, generation_config);
+        std::cerr << "[MTP] MTP pipeline created OK" << std::endl;
+        return mtp_pipe;
+    } catch (const std::exception& e) {
+        // Not a Qwen3.5 MTP model or creation failed — fall through.
+        std::cerr << "[MTP] Pipeline creation failed: " << e.what() << std::endl;
+        return nullptr;
+    } catch (...) {
+        std::cerr << "[MTP] Pipeline creation failed: unknown exception" << std::endl;
+        return nullptr;
+    }
+}
+
 // This is a decorator function that wraps a generation callable to apply parsers and reset them before generation if needed.
 ov::genai::DecodedResults run_generate_with_parsers(const ov::genai::OptionalGenerationConfig& generation_config,
                  const ov::genai::StreamerVariant& streamer,
@@ -183,44 +259,9 @@ static std::unique_ptr<LLMPipelineImplBase> create(
     const ov::genai::Tokenizer& tokenizer,
     const std::string& device,
     const ov::AnyMap& properties) {
-    // MTP speculative decoding: uses the model's built-in MTP head.
-    // Enabled when config.json has mtp_num_hidden_layers > 0.
-    // Does NOT require NPU.
-    auto config_path = models_path / "config.json";
-    if (std::filesystem::is_directory(models_path) && std::filesystem::exists(config_path)) {
-        try {
-            auto qwen35_cfg = ov::genai::modeling::models::Qwen3_5Config::from_json_file(models_path);
-            if (qwen35_cfg.text.mtp_num_hidden_layers > 0) {
-                // Use the loader registry to create weight source and finalizer.
-                auto& registry = ov::genai::loaders::LoaderRegistry::instance();
-                auto loader = registry.get_loader_for_path(models_path);
-                auto loader_config = loader->load_config(models_path.string());
-                auto source = loader->create_weight_source(models_path.string());
-                auto finalizer = loader->create_weight_finalizer(loader_config);
-
-                // Build main model with hidden_states output enabled.
-                auto main_ov_model = ov::genai::modeling::models::create_qwen3_5_text_model(
-                    qwen35_cfg, *source, *finalizer,
-                    false, false, true);
-
-                auto generation_config = utils::from_config_json_if_exists(models_path);
-                auto main_model_desc = ov::genai::ModelDesc(
-                    main_ov_model, tokenizer, device, properties, {}, generation_config);
-
-                // Rebuild source/finalizer for MTP model (weights may have been consumed).
-                auto source2 = loader->create_weight_source(models_path.string());
-                auto finalizer2 = loader->create_weight_finalizer(loader_config);
-
-                // Build MTP draft model.
-                auto mtp_ov_model = ov::genai::modeling::models::create_qwen3_5_mtp_model(
-                    qwen35_cfg, *source2, *finalizer2);
-
-                return std::make_unique<MtpSpeculativeLLMPipeline>(
-                    main_model_desc, mtp_ov_model, device, properties);
-            }
-        } catch (...) {
-            // Not a Qwen3.5 model or config parse failed — fall through to default path.
-        }
+    // Try MTP speculative decoding pipeline for Qwen3.5 models with mtp_num_hidden_layers > 0.
+    if (auto mtp_pipe = try_create_mtp_pipeline(models_path, tokenizer, device, properties)) {
+        return mtp_pipe;
     }
 
     return create(ov::genai::utils::read_model(models_path, properties),
@@ -323,6 +364,11 @@ ov::genai::LLMPipeline::LLMPipeline(
     }
 
     if (m_pimpl == nullptr) {
+        // Try MTP speculative decoding pipeline first (Qwen3.5 models with mtp_num_hidden_layers > 0).
+        m_pimpl = try_create_mtp_pipeline(models_path, tokenizer, device, properties);
+    }
+
+    if (m_pimpl == nullptr) {
         // FIXME: Switch to StatefulPipeline::create after resolving issues
         //        with GPU and CPU for StatefulSpeculativeLLMPipeline
         m_pimpl = std::make_unique<StatefulLLMPipeline>(models_path, tokenizer, device, properties);
@@ -358,6 +404,12 @@ ov::genai::LLMPipeline::LLMPipeline(
         } catch (ov::Exception&) {
             // ignore exceptions from PA
         }
+    }
+
+    if (m_pimpl == nullptr) {
+        // Try MTP speculative decoding pipeline first (Qwen3.5 models with mtp_num_hidden_layers > 0).
+        m_pimpl = try_create_mtp_pipeline(
+            models_path, Tokenizer(models_path, properties), device, properties);
     }
 
     if (m_pimpl == nullptr) {

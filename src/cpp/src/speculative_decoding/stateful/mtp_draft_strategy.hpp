@@ -56,6 +56,15 @@ public:
                                const std::string&           device,
                                const ov::AnyMap&            properties = {});
 
+    // Construct from a pre-compiled main model runner (avoids re-compilation of main model).
+    // Used when the main model OV graph has already been freed to reduce peak memory.
+    MtpSpeculativeLLMPipeline(std::unique_ptr<LLMInferWrapper> main_runner,
+                               std::shared_ptr<ov::Model>        mtp_ov_model,
+                               const std::string&                 device,
+                               const ov::AnyMap&                  properties,
+                               const ov::genai::Tokenizer&        tokenizer,
+                               const ov::genai::GenerationConfig& generation_config);
+
     ~MtpSpeculativeLLMPipeline() override = default;
 
     void finish_chat() override;

@@ -42,6 +42,22 @@ void update_perf_stat_by_infer_duration(ov::genai::RawPerfMetrics& raw_perf_coun
     raw_perf_counters.m_batch_sizes.emplace_back(num_generated_tokens);
 }
 
+// Expand a 2D position_ids tensor [B, S] to a 3D MRoPE tensor [3, B, S]
+// by tiling the same values across all 3 planes (text-only MRoPE).
+ov::Tensor expand_to_mrope_position_ids(const ov::Tensor& pos_2d) {
+    const auto& shape2d = pos_2d.get_shape();
+    OPENVINO_ASSERT(shape2d.size() == 2, "Expected 2D position_ids [B, S]");
+    const std::size_t B = shape2d[0];
+    const std::size_t S = shape2d[1];
+    ov::Tensor pos_3d(ov::element::i64, ov::Shape{3, B, S});
+    const int64_t* src = pos_2d.data<const int64_t>();
+    int64_t* dst = pos_3d.data<int64_t>();
+    for (std::size_t plane = 0; plane < 3; ++plane) {
+        std::copy(src, src + B * S, dst + plane * B * S);
+    }
+    return pos_3d;
+}
+
 }// anonymous namespace
 
 namespace ov {
@@ -64,6 +80,50 @@ namespace genai {
         m_request = ov::genai::utils::singleton_core().compile_model(model_desc.model, m_device, m_properties).create_infer_request();
     }
     raw_perf_metrics.m_inference_durations =  {{ ov::genai::MicroSeconds(0.0f) }};
+
+    // Detect whether the model uses 3D MRoPE position_ids (Qwen3.5 text-only models).
+    for (const auto& input : m_request.get_compiled_model().inputs()) {
+        try {
+            if (input.get_any_name() == "position_ids") {
+                const auto rank = input.get_partial_shape().rank();
+                if (rank.is_static() && rank.get_length() == 3) {
+                    m_is_mrope = true;
+                }
+                break;
+            }
+        } catch (...) {}
+    }
+}
+
+LLMInferWrapper::LLMInferWrapper(
+    ov::InferRequest request,
+    const std::string& device,
+    const ov::AnyMap& properties,
+    const ov::genai::GenerationConfig& generation_config,
+    const ov::genai::Tokenizer& tokenizer)
+    : m_device(device),
+      m_properties(properties),
+      m_generation_config(generation_config),
+      m_tokenizer(tokenizer),
+      m_request(std::move(request)) {
+    // Get KV axes from the already-compiled model's runtime model.
+    m_kv_pos = ov::genai::utils::get_kv_axes_pos(
+        m_request.get_compiled_model().get_runtime_model());
+
+    raw_perf_metrics.m_inference_durations = {{ ov::genai::MicroSeconds(0.0f) }};
+
+    // Detect MRoPE (3D position_ids).
+    for (const auto& input : m_request.get_compiled_model().inputs()) {
+        try {
+            if (input.get_any_name() == "position_ids") {
+                const auto rank = input.get_partial_shape().rank();
+                if (rank.is_static() && rank.get_length() == 3) {
+                    m_is_mrope = true;
+                }
+                break;
+            }
+        } catch (...) {}
+    }
 }
 
 std::string LLMInferWrapper::device() const {
@@ -114,7 +174,11 @@ int64_t LLMInferWrapper::infer_first(const ov::Tensor &input_ids,
 
     m_request.set_tensor("input_ids", input_ids);
     m_request.set_tensor("attention_mask", attention_mask);
-    m_request.set_tensor("position_ids", position_ids);
+    if (m_is_mrope && position_ids.get_shape().size() == 2) {
+        m_request.set_tensor("position_ids", expand_to_mrope_position_ids(position_ids));
+    } else {
+        m_request.set_tensor("position_ids", position_ids);
+    }
     if (m_device != "NPU") {
         // set beam_idx for stateful model: no beam search is used and BATCH_SIZE = 1
         m_request.get_tensor("beam_idx").set_shape({BATCH_SIZE});
@@ -180,6 +244,14 @@ int64_t LLMInferWrapper::infer_next(int64_t token, bool append_perf_stat) {
     // However, attention_mask changes its shape on each iteration, it should be re-set explicitly
     m_new_atten_mask_data.push_back(1);
     m_request.set_tensor("attention_mask", ov::Tensor(ov::element::i64, ov::Shape{1,m_new_atten_mask_data.size()}, m_new_atten_mask_data.data()));
+    // For MRoPE models, position_ids is [3,1,1] and must be re-set each step.
+    if (m_is_mrope) {
+        ov::Tensor pos3d(ov::element::i64, ov::Shape{3, 1, 1});
+        pos3d.data<int64_t>()[0] = m_new_position_id;
+        pos3d.data<int64_t>()[1] = m_new_position_id;
+        pos3d.data<int64_t>()[2] = m_new_position_id;
+        m_request.set_tensor("position_ids", pos3d);
+    }
 
     const auto infer_start = std::chrono::steady_clock::now();
     m_request.infer();
@@ -226,12 +298,23 @@ std::vector<int64_t> LLMInferWrapper::infer_next_return_all(const std::vector<in
     std::fill_n(new_attention_mask.data<int64_t>() + m_num_processed_tokens, tokens_size, 1);
     m_request.set_tensor("attention_mask", new_attention_mask);
 
-    auto position_ids = m_request.get_tensor("position_ids");
-    ov::Tensor new_position_ids(position_ids.get_element_type(), ov::Shape{BATCH_SIZE, tokens_size});
-    std::iota(new_position_ids.data<int64_t>(),
-              new_position_ids.data<int64_t>() + new_position_ids.get_size(),
-              m_num_processed_tokens);
-    m_request.set_tensor("position_ids", new_position_ids);
+    if (m_is_mrope) {
+        // MRoPE: position_ids shape is [3, B, tokens_size]; all 3 planes identical.
+        ov::Tensor new_position_ids(ov::element::i64, ov::Shape{3, BATCH_SIZE, tokens_size});
+        int64_t* pos_data = new_position_ids.data<int64_t>();
+        for (std::size_t plane = 0; plane < 3; ++plane) {
+            std::iota(pos_data + plane * tokens_size, pos_data + (plane + 1) * tokens_size,
+                      static_cast<int64_t>(m_num_processed_tokens));
+        }
+        m_request.set_tensor("position_ids", new_position_ids);
+    } else {
+        auto position_ids = m_request.get_tensor("position_ids");
+        ov::Tensor new_position_ids(position_ids.get_element_type(), ov::Shape{BATCH_SIZE, tokens_size});
+        std::iota(new_position_ids.data<int64_t>(),
+                  new_position_ids.data<int64_t>() + new_position_ids.get_size(),
+                  m_num_processed_tokens);
+        m_request.set_tensor("position_ids", new_position_ids);
+    }
 
     const auto infer_start = std::chrono::steady_clock::now();
     m_request.infer();
@@ -306,7 +389,11 @@ void LLMInferWrapper::release_memory() {
 
 void LLMInferWrapper::set_already_allocated_input_for_1_token() {
     m_request.set_tensor("input_ids", ov::Tensor(ov::element::i64, ov::Shape{1,1},  reinterpret_cast<void*>(&m_new_input_token)));
-    m_request.set_tensor("position_ids", ov::Tensor(ov::element::i64, ov::Shape{1,1}, reinterpret_cast<void*>(&m_new_position_id)));
+    if (!m_is_mrope) {
+        // For standard 2D position_ids, use the pre-allocated scalar optimization.
+        m_request.set_tensor("position_ids", ov::Tensor(ov::element::i64, ov::Shape{1,1}, reinterpret_cast<void*>(&m_new_position_id)));
+    }
+    // For MRoPE models, position_ids [3,1,1] is set fresh each infer_next() call.
 }
 
 // TODO: Use already provided Sampler API, that will support both greedy and

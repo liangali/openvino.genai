@@ -944,6 +944,7 @@ int main(int argc, char* argv[]) try {
     if (load_text_from_ir) {
         std::cout << "[cache-model] Reusing cached text IR: " << text_xml_path << std::endl;
         text_model = core.read_model(text_xml_path.string(), text_bin_path.string());
+        std::cout << "[cache-model] read_model done, nodes=" << text_model->get_ops().size() << std::endl;
         if (use_vl && !is_vl_text_ir_compatible(text_model)) {
             std::cout << "[cache-model] Cached text IR is not VL-compatible (missing visual inputs), rebuilding: "
                       << text_xml_path << std::endl;
@@ -981,6 +982,7 @@ int main(int argc, char* argv[]) try {
         std::cout << "[vision] Compiling vision model on device: " << vision_device << std::endl;
         compiled_vision = core.compile_model(vision_model, vision_device);
     }
+    std::cout << "[cache-model] starting compile_model" << std::endl;
     auto compiled_text = core.compile_model(text_model, opts.device);
 
     ov::Tensor visual_embeds;

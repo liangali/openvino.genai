@@ -6,8 +6,10 @@
 #include "openvino/runtime/core.hpp"
 #include "openvino/core/parallel.hpp"
 #include "openvino/genai/text_streamer.hpp"
+#include "utils.hpp"
 
 #include <algorithm>
+#include <iostream>
 #include <numeric>
 
 namespace {
@@ -114,11 +116,63 @@ MtpSpeculativeLLMPipeline::MtpSpeculativeLLMPipeline(
     m_main_runner = std::make_unique<LLMInferWrapper>(main_model_desc);
     OPENVINO_ASSERT(m_main_runner != nullptr, "Failed to create main model inference wrapper");
 
-    // Compile MTP model and build runner
+    // Compile MTP model and build runner.
+    // The MTP model is built in F32 and does not need quantization.
+    // Strip QUANTIZATION_CONFIG (and any GGUF properties) from the compile properties
+    // since GPU plugin rejects unknown options.
+    const ov::AnyMap& base_props = properties.empty() ? main_model_desc.properties : properties;
+    auto [props_no_quant, _qcfg] = ov::genai::utils::extract_quantization_config(base_props);
+    auto [mtp_props, _gguf] = ov::genai::utils::extract_gguf_properties(props_no_quant);
     auto mtp_compiled = ov::genai::utils::singleton_core().compile_model(
-        mtp_ov_model, device.empty() ? main_model_desc.device : device,
-        properties.empty() ? main_model_desc.properties : properties);
+        mtp_ov_model, device.empty() ? main_model_desc.device : device, mtp_props);
     auto mtp_request = mtp_compiled.create_infer_request();
+
+    m_mtp_runner = std::make_unique<MtpDraftRunner>(
+        std::move(mtp_request), *m_main_runner);
+    OPENVINO_ASSERT(m_mtp_runner != nullptr, "Failed to create MTP draft runner");
+}
+
+MtpSpeculativeLLMPipeline::MtpSpeculativeLLMPipeline(
+    std::unique_ptr<LLMInferWrapper> main_runner,
+    std::shared_ptr<ov::Model>        mtp_ov_model,
+    const std::string&                 device,
+    const ov::AnyMap&                  properties,
+    const ov::genai::Tokenizer&        tokenizer,
+    const ov::genai::GenerationConfig& generation_config)
+    : StatefulSpeculativePipelineBase(tokenizer, generation_config) {
+    OPENVINO_ASSERT(main_runner != nullptr, "Main model runner cannot be null");
+    OPENVINO_ASSERT(mtp_ov_model != nullptr, "MTP model cannot be null");
+
+    m_tokenizer    = tokenizer;
+    m_main_runner  = std::move(main_runner);
+
+    // Compile MTP model; strip quantization/GGUF properties.
+    // The MTP model itself is always built in F32 (small 1-layer draft head);
+    // quantization properties are not needed here.
+    auto [props_no_quant, _qcfg] = ov::genai::utils::extract_quantization_config(properties);
+    auto [mtp_props, _gguf]      = ov::genai::utils::extract_gguf_properties(props_no_quant);
+
+    // Try compiling MTP on the same device as the main model.
+    // If that fails (e.g. GPU VRAM exhausted by the large main model), fall back to CPU.
+    ov::InferRequest mtp_request;
+    bool compiled_on_gpu = false;
+    try {
+        auto mtp_compiled = ov::genai::utils::singleton_core().compile_model(
+            mtp_ov_model, device, mtp_props);
+        mtp_request = mtp_compiled.create_infer_request();
+        compiled_on_gpu = true;
+    } catch (const std::exception& e) {
+        if (device != "CPU") {
+            std::cerr << "[MTP] " << device << " compile failed (" << e.what()
+                      << "), falling back to CPU for MTP draft model." << std::endl;
+            auto mtp_compiled_cpu = ov::genai::utils::singleton_core().compile_model(
+                mtp_ov_model, "CPU");
+            mtp_request = mtp_compiled_cpu.create_infer_request();
+        } else {
+            throw;
+        }
+    }
+    (void)compiled_on_gpu;
 
     m_mtp_runner = std::make_unique<MtpDraftRunner>(
         std::move(mtp_request), *m_main_runner);
@@ -189,6 +243,7 @@ EncodedResults MtpSpeculativeLLMPipeline::generate_tokens(const EncodedInputs& i
 
     // ── Decode loop ───────────────────────────────────────────────────────────
     ManualTimer iteration_timer("MTP speculative decode: iteration");
+    std::size_t accept_count = 0, reject_count = 0;
 
     while (m_main_runner->can_infer() && (streaming_status == ov::genai::StreamingStatus::RUNNING)) {
         iteration_timer.start();
@@ -204,32 +259,35 @@ EncodedResults MtpSpeculativeLLMPipeline::generate_tokens(const EncodedInputs& i
         // Draft one token using MTP
         int64_t draft_token = m_mtp_runner->infer_next(out_token, current_pos);
 
-        // Verify: ONE main call for both tokens
-        auto ref_tokens = m_main_runner->infer_next_return_all({out_token, draft_token});
-        // ref_tokens[0] = prediction for out_token position (= what main thinks follows out_token)
-        // ref_tokens[1] = prediction for draft_token position
+        // Step 1: verify out_token — one main model call at position current_pos.
+        // Main model takes out_token as input and predicts the next token.
+        int64_t ref0 = m_main_runner->infer_next(out_token);
 
-        if (ref_tokens[0] == draft_token) {
-            // ACCEPT: draft was correct
+        if (ref0 == draft_token) {
+            // ACCEPT: draft was correct. Run main model on draft_token to get next token.
+            int64_t ref1 = m_main_runner->infer_next(draft_token);
             streaming_status = stream_generated_tokens(streamer_ptr,
-                std::vector<int64_t>{draft_token, ref_tokens[1]});
+                std::vector<int64_t>{draft_token, ref1});
             results.tokens[0].push_back(draft_token);
-            results.tokens[0].push_back(ref_tokens[1]);
-            out_token        = ref_tokens[1];
+            results.tokens[0].push_back(ref1);
+            out_token        = ref1;
             mtp_prefix_token = draft_token;
 
+            ++accept_count;
             m_sd_metrics.update_acceptance_rate(0, 100.f);
             m_sd_metrics.update_draft_accepted_tokens(0, 1u);
             m_sd_metrics.update_generated_len(2u);
         } else {
-            // REJECT: trim ONLY main KV cache, not MTP
-            m_main_runner->trim_kv_cache(1);
+            // REJECT: use ref0 as the output token.
+            // MTP already processed out_token in its KV; main also processed out_token.
+            // Both are in sync at current_pos+1. No KV trim needed.
             streaming_status = stream_generated_tokens(streamer_ptr,
-                std::vector<int64_t>{ref_tokens[0]});
-            results.tokens[0].push_back(ref_tokens[0]);
-            out_token        = ref_tokens[0];
+                std::vector<int64_t>{ref0});
+            results.tokens[0].push_back(ref0);
+            out_token        = ref0;
             // mtp_prefix_token stays -1
 
+            ++reject_count;
             m_sd_metrics.update_acceptance_rate(0, 0.f);
             m_sd_metrics.update_draft_accepted_tokens(0, 0u);
             m_sd_metrics.update_generated_len(1u);
@@ -249,6 +307,13 @@ EncodedResults MtpSpeculativeLLMPipeline::generate_tokens(const EncodedInputs& i
     m_streaming_was_cancelled = (streaming_status == ov::genai::StreamingStatus::CANCEL);
     if (streamer_ptr) {
         streamer_ptr->end();
+    }
+
+    // Print accept/reject rate
+    const std::size_t total = accept_count + reject_count;
+    if (total > 0) {
+        std::cerr << "[MTP] Accept rate: " << accept_count << "/" << total
+                  << " = " << (100.0 * accept_count / total) << "%" << std::endl;
     }
 
     // Reset state if not in a chat session
