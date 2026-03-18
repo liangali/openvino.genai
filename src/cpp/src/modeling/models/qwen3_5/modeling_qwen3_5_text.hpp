@@ -299,6 +299,18 @@ public:
                           const Tensor* visual_embeds = nullptr,
                           const Tensor* visual_pos_mask = nullptr);
 
+    // Returns {logits [B,1,V], last_hidden [B,1,H]}.
+    // last_hidden is the post-norm, pre-lm_head slice (same tensor lm_head sees).
+    std::pair<Tensor, Tensor> forward_with_hidden(
+        const Tensor& input_ids,
+        const Tensor& position_ids,
+        const Tensor& beam_idx,
+        const Tensor& full_attention_mask,
+        const Tensor* linear_attention_mask,
+        const Tensor* cache_position,
+        const Tensor* visual_embeds = nullptr,
+        const Tensor* visual_pos_mask = nullptr);
+
 private:
     Qwen3_5TextModelConfig cfg_;
     Qwen3_5Model model_;

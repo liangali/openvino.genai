@@ -938,6 +938,35 @@ Tensor Qwen3_5ForCausalLM::forward_embeds(const Tensor& inputs_embeds,
     return lm_head_.forward(hidden);
 }
 
+std::pair<Tensor, Tensor> Qwen3_5ForCausalLM::forward_with_hidden(
+    const Tensor& input_ids,
+    const Tensor& position_ids,
+    const Tensor& beam_idx,
+    const Tensor& full_attention_mask,
+    const Tensor* linear_attention_mask,
+    const Tensor* cache_position,
+    const Tensor* visual_embeds,
+    const Tensor* visual_pos_mask) {
+    // model_ is the inner Qwen3_5Model (the transformer backbone).
+    // This call is NOT recursive — it calls Qwen3_5Model::forward(), not
+    // Qwen3_5ForCausalLM::forward(). Returns hidden [B, T, H] (pre-lm_head).
+    auto hidden = model_.forward(input_ids,
+                                 position_ids,
+                                 beam_idx,
+                                 full_attention_mask,
+                                 linear_attention_mask,
+                                 cache_position,
+                                 visual_embeds,
+                                 visual_pos_mask);
+    // Slice to last token only: [B, T, H] → [B, 1, H].
+    // ops::slice(tensor, start, end, step, axis): axis=1 (token axis), start=-1, end=MAX.
+    auto last_hidden = ops::slice(hidden, -1, std::numeric_limits<int64_t>::max(), 1, 1);
+    // last_hidden shape: [B, 1, H] — verify in debugger before use.
+    // If shape is [B, H] (squeezed), adjust ops::slice axis or use ops::unsqueeze.
+    auto logits = lm_head_.forward(last_hidden);
+    return {logits, last_hidden};
+}
+
 std::shared_ptr<ov::Model> create_qwen3_5_text_model(
     const Qwen3_5Config& cfg,
     ov::genai::modeling::weights::WeightSource& source,
