@@ -4,7 +4,9 @@
 #include "modeling/models/qwen3_5/modeling_qwen3_5_mtp.hpp"
 
 #include <cmath>
+#include <cstring>
 #include <limits>
+#include <unordered_map>
 #include <openvino/core/except.hpp>
 #include <openvino/openvino.hpp>
 
@@ -108,6 +110,88 @@ Tensor Qwen3_5MtpForDraft::forward(const Tensor& input_ids,
     return lm_head_.forward(normed);
 }
 
+namespace {
+
+/// A WeightSource that checks a pre-populated in-memory overlay first,
+/// then falls back to the real source.  Used to inject synthetic fused
+/// expert tensors when the MTP checkpoint stores per-expert 2-D weights.
+class OverlayWeightSource : public weights::WeightSource {
+public:
+    explicit OverlayWeightSource(weights::WeightSource& base) : base_(base) {}
+
+    void put(const std::string& name, ov::Tensor tensor) {
+        overlay_[name] = std::move(tensor);
+    }
+
+    std::vector<std::string> keys() const override {
+        std::vector<std::string> k = base_.keys();
+        for (const auto& p : overlay_)
+            k.push_back(p.first);
+        return k;
+    }
+
+    bool has(const std::string& name) const override {
+        return overlay_.count(name) > 0 || base_.has(name);
+    }
+
+    const ov::Tensor& get_tensor(const std::string& name) const override {
+        auto it = overlay_.find(name);
+        if (it != overlay_.end())
+            return it->second;
+        return base_.get_tensor(name);
+    }
+
+    void release_tensor(const std::string& name) override {
+        base_.release_tensor(name);
+    }
+
+private:
+    weights::WeightSource& base_;
+    std::unordered_map<std::string, ov::Tensor> overlay_;
+};
+
+/// Stack per-expert 2-D tensors [R, C] (e in [0, num_experts)) into [E, R, C].
+ov::Tensor stack_experts(weights::WeightSource& source,
+                         const std::string& key_prefix,
+                         const std::string& key_suffix,
+                         int32_t num_experts) {
+    const auto& t0 = source.get_tensor(key_prefix + "0" + key_suffix);
+    const auto t0_shape = t0.get_shape();
+    OPENVINO_ASSERT(t0_shape.size() == 2,
+                    "stack_experts: expected 2-D per-expert tensor, got rank ", t0_shape.size());
+    ov::Shape out_shape = {static_cast<size_t>(num_experts), t0_shape[0], t0_shape[1]};
+    ov::Tensor result(t0.get_element_type(), out_shape);
+    const size_t expert_bytes = t0.get_byte_size();
+    uint8_t* dst = static_cast<uint8_t*>(result.data());
+    for (int32_t e = 0; e < num_experts; ++e) {
+        const auto& te = source.get_tensor(key_prefix + std::to_string(e) + key_suffix);
+        std::memcpy(dst + static_cast<size_t>(e) * expert_bytes, te.data(), expert_bytes);
+    }
+    return result;
+}
+
+/// Concatenate two [E, I, H] tensors along dim 1 to produce [E, 2*I, H].
+ov::Tensor concat_dim1(const ov::Tensor& a, const ov::Tensor& b) {
+    const auto sa = a.get_shape();
+    OPENVINO_ASSERT(sa.size() == 3, "concat_dim1: expected rank 3, got ", sa.size());
+    OPENVINO_ASSERT(a.get_element_type() == b.get_element_type(),
+                    "concat_dim1: element type mismatch");
+    const size_t E = sa[0], I = sa[1], H = sa[2];
+    const size_t elem_size = a.get_element_type().size();
+    ov::Tensor result(a.get_element_type(), {E, 2 * I, H});
+    const uint8_t* src_a = static_cast<const uint8_t*>(a.data());
+    const uint8_t* src_b = static_cast<const uint8_t*>(b.data());
+    uint8_t* dst = static_cast<uint8_t*>(result.data());
+    const size_t row_bytes = I * H * elem_size;
+    for (size_t e = 0; e < E; ++e) {
+        std::memcpy(dst + e * 2 * row_bytes,               src_a + e * row_bytes, row_bytes);
+        std::memcpy(dst + e * 2 * row_bytes + row_bytes,   src_b + e * row_bytes, row_bytes);
+    }
+    return result;
+}
+
+}  // namespace
+
 std::shared_ptr<ov::Model> create_qwen3_5_mtp_model(
     const Qwen3_5Config& cfg,
     ov::genai::modeling::weights::WeightSource& source,
@@ -179,7 +263,29 @@ std::shared_ptr<ov::Model> create_qwen3_5_mtp_model(
     options.report_missing   = true;
     options.report_unmatched = false;
 
-    (void)ov::genai::modeling::weights::load_model(model, source, finalizer, options);
+    // MTP checkpoints store MoE expert weights as per-expert 2-D tensors:
+    //   mtp.layers.0.mlp.experts.N.gate_proj.weight  [I, H]
+    //   mtp.layers.0.mlp.experts.N.up_proj.weight    [I, H]
+    //   mtp.layers.0.mlp.experts.N.down_proj.weight  [H, I]
+    //
+    // Qwen3_5SparseMoeBlock expects fused 3-D keys in the source:
+    //   mtp.layers.0.mlp.experts.gate_up_proj        [E, 2*I, H]
+    //   mtp.layers.0.mlp.experts.down_proj           [E, H, I]
+    //
+    // Pre-stack and fuse per-expert tensors into an overlay source so the
+    // existing custom loaders in Qwen3_5SparseMoeBlock work unchanged.
+    const std::string expert_pfx = "mtp.layers.0.mlp.experts.";
+    OverlayWeightSource overlay(source);
+    if (model_cfg.num_experts > 0 && source.has(expert_pfx + "0.gate_proj.weight")) {
+        const int32_t E = model_cfg.num_experts;
+        auto gate_s = stack_experts(source, expert_pfx, ".gate_proj.weight", E);
+        auto up_s   = stack_experts(source, expert_pfx, ".up_proj.weight",   E);
+        auto down_s = stack_experts(source, expert_pfx, ".down_proj.weight", E);
+        overlay.put(expert_pfx + "gate_up_proj", concat_dim1(gate_s, up_s));
+        overlay.put(expert_pfx + "down_proj",    std::move(down_s));
+    }
+
+    (void)ov::genai::modeling::weights::load_model(model, overlay, finalizer, options);
 
     // ── Model inputs ─────────────────────────────────────────────────────────
     auto input_ids    = ctx.parameter("input_ids",     ov::element::i64,
