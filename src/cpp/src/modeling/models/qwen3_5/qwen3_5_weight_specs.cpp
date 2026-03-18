@@ -229,7 +229,9 @@ build_qwen3_5_mtp_weight_specs(const Qwen3_5TextConfig& cfg_in) {
     // Embedding table — always needed by the MTP graph.
     // When mtp_use_dedicated_embeddings=false the MTP graph reuses the main
     // model embedding weights; the loader handles the remapping.
-    add(specs, "mtp.embed_tokens.weight", {V, H});
+    // Checkpoint key: "model.language_model.embed_tokens.weight"
+    // Remapped to "mtp.embed_tokens.weight" via PackedMapping in create_qwen3_5_mtp_model().
+    add(specs, "model.language_model.embed_tokens.weight", {V, H});
 
     // Projection norms and fusion FC (always present regardless of dedicated embeddings)
     add(specs, "mtp.pre_fc_norm_embedding.weight", {H});
