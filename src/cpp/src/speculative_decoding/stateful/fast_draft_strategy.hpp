@@ -46,6 +46,8 @@ public:
 
     void release_memory();
 
+    const ov::InferRequest& get_infer_request() const { return m_request; }
+
 public:
     ov::genai::RawPerfMetrics raw_perf_metrics;
 
