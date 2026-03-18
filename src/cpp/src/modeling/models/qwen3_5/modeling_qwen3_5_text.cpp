@@ -976,6 +976,7 @@ std::shared_ptr<ov::Model> create_qwen3_5_text_model(
     text_cfg.router_aux_loss_coef = cfg.text.router_aux_loss_coef;
     text_cfg.mrope_interleaved = cfg.text.rope.mrope_interleaved;
     text_cfg.mrope_section = cfg.text.rope.mrope_section;
+    text_cfg.mtp_num_hidden_layers = cfg.text.mtp_num_hidden_layers;
 
     const auto effective_cfg = apply_qwen3_5_layer_limit(text_cfg);
 

@@ -73,6 +73,8 @@ struct Qwen3_5TextModelConfig {
     bool mrope_interleaved = false;
     std::vector<int32_t> mrope_section = {11, 11, 10};
 
+    int32_t mtp_num_hidden_layers = 0;
+
     bool is_moe_enabled() const {
         return num_experts > 0 && moe_intermediate_size > 0 && shared_expert_intermediate_size > 0;
     }
