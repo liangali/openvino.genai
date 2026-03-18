@@ -226,6 +226,11 @@ build_qwen3_5_mtp_weight_specs(const Qwen3_5TextConfig& cfg_in) {
 
     std::vector<Spec> specs;
 
+    // Embedding table — always needed by the MTP graph.
+    // When mtp_use_dedicated_embeddings=false the MTP graph reuses the main
+    // model embedding weights; the loader handles the remapping.
+    add(specs, "mtp.embed_tokens.weight", {V, H});
+
     // Projection norms and fusion FC (always present regardless of dedicated embeddings)
     add(specs, "mtp.pre_fc_norm_embedding.weight", {H});
     add(specs, "mtp.pre_fc_norm_hidden.weight",    {H});
@@ -266,8 +271,12 @@ build_qwen3_5_mtp_weight_specs(const Qwen3_5TextConfig& cfg_in) {
     // Final norm
     add(specs, "mtp.norm.weight", {H});
 
-    // LM head — same key as main model (shared weights, reloaded for MTP model)
-    add(specs, "lm_head.weight", {V, H});
+    // LM head — present only when tie_word_embeddings=false (e.g. 35B-A3B).
+    // When tie_word_embeddings=true (e.g. 2B) the lm_head shares the embedding
+    // table and no separate lm_head.weight tensor exists in the checkpoint.
+    if (!cfg.tie_word_embeddings) {
+        add(specs, "lm_head.weight", {V, H});
+    }
 
     return specs;
 }
