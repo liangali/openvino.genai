@@ -42,6 +42,7 @@ public:
 
 private:
     Qwen3_5TextModelConfig cfg_;
+    int32_t rotary_dim_ = 0;  // computed from cfg_ in constructor
     // Embed + fusion
     ov::genai::modeling::VocabEmbedding   embed_tokens_;
     Qwen3_5RMSNorm                        pre_fc_norm_embed_;
