@@ -54,7 +54,7 @@ struct SampleOptions {
     std::string device = "GPU";
     int max_new_tokens = 64;
     bool cache_model = false;
-    bool no_mtp = false;
+    bool enable_mtp = false;
 
     std::string dummy_model = "dense";
 
@@ -276,8 +276,8 @@ SampleOptions parse_cli(int argc, char* argv[]) {
         } else if (arg == "--think") {
             int val = parse_i32(take_value("--think"), "--think");
             opts.enable_thinking = (val != 0);
-        } else if (arg == "--no-mtp") {
-            opts.no_mtp = true;
+        } else if (arg == "--mtp") {
+            opts.enable_mtp = true;
         } else {
             throw std::runtime_error("Unknown option: " + arg);
         }
@@ -1050,9 +1050,9 @@ int main(int argc, char* argv[]) try {
     }
 
     // MTP: build draft model from weights on first run; reload from cached IR on second run.
-    // Only active for --mode text (not vl), when config declares MTP layers, and --no-mtp not set.
+    // Only active when --mtp is explicitly passed, for --mode text (not vl), and config declares MTP layers.
     const bool try_mtp = !use_vl
-                      && !opts.no_mtp
+                      && opts.enable_mtp
                       && !use_dummy_mode_flag
                       && cfg.text.mtp_num_hidden_layers > 0;
     std::optional<ov::CompiledModel> compiled_mtp;
