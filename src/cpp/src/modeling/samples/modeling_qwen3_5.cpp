@@ -1381,7 +1381,7 @@ int main(int argc, char* argv[]) try {
         }
 
         if (accept_count + reject_count > 0) {
-            std::cerr << "[MTP] Accept rate: " << accept_count
+            std::cout << "[MTP] Accept rate: " << accept_count
                       << "/" << (accept_count + reject_count)
                       << " = " << (100.0 * accept_count / (accept_count + reject_count))
                       << "%" << std::endl;
