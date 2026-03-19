@@ -38,6 +38,7 @@
 #include "modeling/models/qwen3_5/processing_qwen3_5.hpp"
 #include "modeling/models/qwen3_5/qwen3_5_weight_specs.hpp"
 #include "modeling/models/qwen3_5/mtp_draft_runner.hpp"
+#include "modeling/models/qwen3_5/modeling_qwen3_5_mtp.hpp"
 #include "modeling/weights/quantization_config.hpp"
 #include "modeling/weights/synthetic_weight_source.hpp"
 #include "sampling/logit_processor.hpp"
@@ -884,10 +885,13 @@ int main(int argc, char* argv[]) try {
         text_ir_stem += "_l" + std::to_string(*opts.num_layers);
     }
     std::string vision_ir_stem = "qwen3_5_vision" + quant_cache_suffix(vision_quant_config);
+    const std::string mtp_ir_stem = "qwen3_5_mtp" + quant_cache_suffix(text_quant_config);
     const auto text_xml_path = ir_dir / (text_ir_stem + ".xml");
     const auto text_bin_path = ir_dir / (text_ir_stem + ".bin");
     const auto vision_xml_path = ir_dir / (vision_ir_stem + ".xml");
     const auto vision_bin_path = ir_dir / (vision_ir_stem + ".bin");
+    const auto mtp_xml_path = ir_dir / (mtp_ir_stem + ".xml");
+    const auto mtp_bin_path = ir_dir / (mtp_ir_stem + ".bin");
 
     const bool load_text_from_ir = opts.cache_model && !use_dummy_mode_flag && has_ir_model_pair(text_xml_path, text_bin_path);
     const bool load_vision_from_ir =
@@ -1045,7 +1049,7 @@ int main(int argc, char* argv[]) try {
         }
     }
 
-    // MTP auto-detect: look for mtp_model.xml + mtp_model.bin alongside the main model.
+    // MTP: build draft model from weights on first run; reload from cached IR on second run.
     // Only active for --mode text (not vl), when config declares MTP layers, and --no-mtp not set.
     const bool try_mtp = !use_vl
                       && !opts.no_mtp
@@ -1053,20 +1057,27 @@ int main(int argc, char* argv[]) try {
                       && cfg.text.mtp_num_hidden_layers > 0;
     std::optional<ov::CompiledModel> compiled_mtp;
     if (try_mtp) {
-        const auto mtp_xml = model_dir / "mtp_model.xml";
-        const auto mtp_bin = model_dir / "mtp_model.bin";
-        if (has_ir_model_pair(mtp_xml, mtp_bin)) {
-            try {
-                auto mtp_ov_model = core.read_model(mtp_xml.string(), mtp_bin.string());
-                compiled_mtp = core.compile_model(mtp_ov_model, opts.device);
-                std::cout << "[MTP] Draft model compiled on " << opts.device << std::endl;
-            } catch (const std::exception& e) {
-                std::cerr << "[MTP] Warning: failed to compile MTP model (" << e.what()
-                          << "), falling back to single-token." << std::endl;
-                compiled_mtp.reset();
-            }
+        std::shared_ptr<ov::Model> mtp_ov_model;
+        const bool load_mtp_from_ir = opts.cache_model && has_ir_model_pair(mtp_xml_path, mtp_bin_path);
+        if (load_mtp_from_ir) {
+            std::cout << "[cache-model] Reusing cached MTP IR: " << mtp_xml_path << std::endl;
+            mtp_ov_model = core.read_model(mtp_xml_path.string(), mtp_bin_path.string());
         } else {
-            std::cout << "[MTP] mtp_model.xml not found alongside model, using single-token." << std::endl;
+            auto& weight_source = ensure_weight_source();
+            ov::genai::safetensors::SafetensorsWeightFinalizer mtp_finalizer(text_quant_config);
+            mtp_ov_model = ov::genai::modeling::models::create_qwen3_5_mtp_model(cfg, weight_source, mtp_finalizer);
+            if (opts.cache_model) {
+                ov::serialize(mtp_ov_model, mtp_xml_path.string(), mtp_bin_path.string());
+                std::cout << "[cache-model] Saved MTP IR: " << mtp_xml_path << std::endl;
+            }
+        }
+        try {
+            compiled_mtp = core.compile_model(mtp_ov_model, opts.device);
+            std::cout << "[MTP] Draft model compiled on " << opts.device << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "[MTP] Warning: failed to compile MTP model (" << e.what()
+                      << "), falling back to single-token." << std::endl;
+            compiled_mtp.reset();
         }
     }
 
