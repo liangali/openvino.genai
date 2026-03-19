@@ -14,39 +14,10 @@
 
 #include "speculative_decoding/speculative_decoding_metrics.hpp"
 #include "speculative_decoding/stateful/fast_draft_strategy.hpp"  // for LLMInferWrapper, StatefulSpeculativePipelineBase
+#include "modeling/models/qwen3_5/mtp_draft_runner.hpp"
 
 namespace ov {
 namespace genai {
-
-// ── MtpDraftRunner ──────────────────────────────────────────────────────────
-// Wraps the compiled MTP OV model (from create_qwen3_5_mtp_model()).
-class MtpDraftRunner {
-public:
-    MtpDraftRunner(ov::InferRequest mtp_request,
-                   LLMInferWrapper& main_runner);
-
-    // Draft one token. Returns argmax of MTP logits.
-    int64_t infer_next(int64_t prev_token_id, int64_t position);
-
-    // Roll back MTP KV cache by trim_count positions.
-    void trim_kv_cache(std::size_t trim_count);
-
-    // Reset all KV state (new sequence).
-    void reset_state();
-
-    std::size_t get_num_processed_tokens() const { return num_processed_tokens_; }
-
-private:
-    ov::InferRequest          mtp_runner_;
-    LLMInferWrapper&          main_runner_ref_;
-    ov::genai::utils::KVAxesPosition kv_pos_;
-
-    ov::Tensor input_ids_buf_;
-    ov::Tensor position_ids_buf_;
-    ov::Tensor beam_idx_buf_;
-
-    std::size_t num_processed_tokens_ = 0;
-};
 
 // ── MtpSpeculativeLLMPipeline ───────────────────────────────────────────────
 class MtpSpeculativeLLMPipeline : public StatefulSpeculativePipelineBase {
