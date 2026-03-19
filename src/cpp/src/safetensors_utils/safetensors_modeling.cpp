@@ -661,7 +661,7 @@ std::shared_ptr<ov::Model> create_model_with_modeling_api(
         auto qwen35_cfg = ov::genai::modeling::models::Qwen3_5Config::from_json_file(model_dir);
         // Create the text model (no visual inputs for greedy_causal_lm)
         ov_model = ov::genai::modeling::models::create_qwen3_5_text_model(
-            qwen35_cfg, source, finalizer, false, false);
+            qwen35_cfg, source, finalizer, false, false, false);
     } else {
         throw std::runtime_error("Unsupported model architecture '" + hf_config.model_type + "'");
     }

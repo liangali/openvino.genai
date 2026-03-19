@@ -959,7 +959,8 @@ int main(int argc, char* argv[]) try {
             weight_source,
             text_finalizer,
             false,
-            use_vl);
+            use_vl,
+            false);
         if (opts.cache_model) {
             ov::serialize(text_model, text_xml_path.string(), text_bin_path.string());
             std::cout << "[cache-model] Saved text IR: " << text_xml_path << std::endl;

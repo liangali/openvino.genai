@@ -84,7 +84,8 @@ TEST(Qwen3_5DummyINT4Binding, BuildsTextAndVisionWithQuantizedFinalizer) {
                             source,
                             text_finalizer,
                             false,
-                            true));
+                            true,
+                            false));
     }
     {
         ov::genai::safetensors::SafetensorsWeightFinalizer vision_finalizer(qcfg);
