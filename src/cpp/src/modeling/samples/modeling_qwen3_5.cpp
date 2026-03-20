@@ -1312,12 +1312,6 @@ int main(int argc, char* argv[]) try {
     // MTP path (consistent with MtpSpeculativeLLMPipeline); use --no-mtp if
     // repetition/frequency/presence penalties are required.
     if (mtp_runner && !use_sampling) {
-        // KV axes position for the main model — needed by trim_kv_main.
-        // Hardcode the standard [batch, heads, seq_len, head_dim] layout (seq_axis=2)
-        // rather than calling get_kv_axes_pos(text_request.get_compiled_model().get_runtime_model())
-        // because get_runtime_model() returns nullptr when the model was loaded from a cached IR blob.
-        const ov::genai::utils::KVAxesPosition kv_pos_main{0u, 2u};
-
         // run_main_step: set step_ids/position_ids, call text_request.infer(),
         // advance past_len, return argmax of logits.
         // Captures logits and logit_buf from outer scope by reference — do NOT
@@ -1347,139 +1341,6 @@ int main(int argc, char* argv[]) try {
             return argmax_f32(logit_buf);
         };
 
-        // Argmax at sequence position pos in logits [batch, M, vocab].
-        // Handles f32, f16, bf16. Uses batch element 0 only.
-        auto argmax_at_pos = [](const ov::Tensor& logits_t, size_t pos) -> int64_t {
-            const auto& shape = logits_t.get_shape();
-            const size_t V = shape[2];
-            const size_t offset = pos * V;
-            if (logits_t.get_element_type() == ov::element::f32) {
-                const auto* d = logits_t.data<const float>() + offset;
-                return static_cast<int64_t>(std::max_element(d, d + V) - d);
-            } else if (logits_t.get_element_type() == ov::element::f16) {
-                const auto* d = logits_t.data<const ov::float16>() + offset;
-                size_t best = 0;
-                float best_val = static_cast<float>(d[0]);
-                for (size_t i = 1; i < V; ++i) {
-                    float v = static_cast<float>(d[i]);
-                    if (v > best_val) { best_val = v; best = i; }
-                }
-                return static_cast<int64_t>(best);
-            } else {  // bf16
-                const auto* d = logits_t.data<const ov::bfloat16>() + offset;
-                size_t best = 0;
-                float best_val = static_cast<float>(d[0]);
-                for (size_t i = 1; i < V; ++i) {
-                    float v = static_cast<float>(d[i]);
-                    if (v > best_val) { best_val = v; best = i; }
-                }
-                return static_cast<int64_t>(best);
-            }
-        };
-
-        ov::Tensor last_verify_hs;  // deep copy of main hidden_states after each verify call
-
-        // Helpers to save/restore linear-attention (GDA) recurrent states.
-        // Qwen3.5 is a hybrid model: full-attention + GDA layers.
-        // Batched verify adds rejected draft tokens to the GDA recurrent state, causing
-        // state contamination and output divergence.  We save all "linear_states.*"
-        // variable states before each verify pass and restore them on reject.
-        struct GDASnapshot {
-            struct Entry { std::string name; ov::Tensor tensor; };
-            std::vector<Entry> entries;
-        };
-        auto save_linear_states = [&]() -> GDASnapshot {
-            GDASnapshot snap;
-            for (auto& vs : text_request.query_state()) {
-                if (vs.get_name().find("linear_states") != std::string::npos) {
-                    const ov::Tensor t = vs.get_state();
-                    ov::Tensor copy(t.get_element_type(), t.get_shape());
-                    t.copy_to(copy);
-                    snap.entries.push_back({vs.get_name(), std::move(copy)});
-                }
-            }
-            return snap;
-        };
-        auto restore_linear_states = [&](const GDASnapshot& snap) {
-            for (auto& vs : text_request.query_state()) {
-                for (const auto& e : snap.entries) {
-                    if (vs.get_name() == e.name) {
-                        vs.set_state(e.tensor);
-                        break;
-                    }
-                }
-            }
-        };
-
-        // run_main_verify: batched verify pass — first_token + drafts in one forward.
-        // Sets all four tensors. Increments past_len by M. Returns M argmax token IDs.
-        // Uses USM host tensors (same as run_main_step) to avoid GPU data-transfer issues.
-        auto run_main_verify = [&](int64_t first_token,
-                                   const std::vector<int64_t>& drafts) -> std::vector<int64_t> {
-            const size_t M = drafts.size() + 1;
-
-            // input_ids: {batch, M} — USM host tensor
-            ov::Tensor verify_ids = make_usm_host_tensor(gpu_ctx, ov::element::i64, {batch, M});
-            {
-                auto* d = verify_ids.data<int64_t>();
-                for (size_t b = 0; b < batch; ++b) {
-                    d[b * M + 0] = first_token;
-                    for (size_t k = 0; k < drafts.size(); ++k)
-                        d[b * M + 1 + k] = drafts[k];
-                }
-            }
-
-            // position_ids: {3, batch, M} — 3 planes, same value per plane — USM host tensor
-            ov::Tensor verify_pos = make_usm_host_tensor(gpu_ctx, ov::element::i64, {3, batch, M});
-            {
-                auto* p = verify_pos.data<int64_t>();
-                for (size_t plane = 0; plane < 3; ++plane) {
-                    for (size_t b = 0; b < batch; ++b) {
-                        for (size_t m = 0; m < M; ++m) {
-                            p[plane * batch * M + b * M + m] =
-                                past_len + static_cast<int64_t>(m) + rope_deltas_data[b];
-                        }
-                    }
-                }
-            }
-
-            // attention_mask: {batch, past_len+M} — all ones — covers full KV sequence
-            const size_t full_kv_len = static_cast<size_t>(past_len) + M;
-            ov::Tensor verify_mask = make_usm_host_tensor(gpu_ctx, ov::element::i64, {batch, full_kv_len});
-            std::fill(verify_mask.data<int64_t>(), verify_mask.data<int64_t>() + batch * full_kv_len, int64_t{1});
-
-            text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kInputIds,      verify_ids);
-            text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kAttentionMask, verify_mask);
-            text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kPositionIds,   verify_pos);
-            text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kBeamIdx,       usm_beam_idx);
-            text_request.infer();
-
-            // Capture hidden_states as deep copy (subsequent infers overwrite it)
-            const ov::Tensor raw_hs = text_request.get_tensor("hidden_states");
-            last_verify_hs = ov::Tensor(raw_hs.get_element_type(), raw_hs.get_shape());
-            raw_hs.copy_to(last_verify_hs);
-
-            logits = text_request.get_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kLogits);
-            past_len += static_cast<int64_t>(M);
-
-            std::vector<int64_t> refs(M);
-            for (size_t m = 0; m < M; ++m)
-                refs[m] = argmax_at_pos(logits, m);
-
-            return refs;
-        };
-
-        // trim_kv_main: trim main model KV cache by trim_count positions via state tensors.
-        auto trim_kv_main = [&](int trim_count) {
-            if (trim_count <= 0) return;
-            ov::genai::utils::KVCacheState trim_state;
-            trim_state.num_tokens_to_trim = static_cast<size_t>(trim_count);
-            trim_state.seq_length_axis    = kv_pos_main.seq_len;
-            trim_state.reset_mem_state    = false;
-            ov::genai::utils::trim_kv_cache(text_request, trim_state, {});
-            past_len -= trim_count;
-        };
-
         const int N = opts.mtp_draft_n;
         int64_t mtp_prefix_token = -1;  // -1 = no pending KV sync; token IDs are non-negative
         size_t accept_count = 0, reject_count = 0;
@@ -1489,20 +1350,17 @@ int main(int argc, char* argv[]) try {
         // hidden state — not the full prefill sequence.
         {
             const ov::Tensor raw_hs = text_request.get_tensor("hidden_states");
-            last_verify_hs = ov::Tensor(raw_hs.get_element_type(), raw_hs.get_shape());
-            raw_hs.copy_to(last_verify_hs);
-            const size_t last_idx = last_verify_hs.get_shape()[1] - 1;
-            mtp_runner->inject_hidden_state_slice(last_verify_hs, last_idx);
+            mtp_runner->inject_hidden_state_slice(raw_hs, raw_hs.get_shape()[1] - 1);
         }
 
         while (generated.size() < static_cast<size_t>(opts.max_new_tokens)) {
             if (!stop_token_ids.empty() && stop_token_ids.count(next_id) > 0) break;
 
-            // [0] KV sync (deferred full-accept from previous super-step)
+            // [0] KV sync (deferred full-accept from previous super-step).
+            // After full accept: main KV = past_len, MTP KV = past_len - 1.
+            // infer_next at position past_len-1 advances MTP KV to past_len.
+            // Reads hidden_states live from text_request (last run_main_step output).
             if (mtp_prefix_token >= 0) {
-                // last_verify_hs is [1, N+1, H]. Inject hidden state at index N
-                // (= hidden state of drafts[N-1], the last accepted token in the verify pass).
-                mtp_runner->inject_hidden_state_slice(last_verify_hs, static_cast<size_t>(N));
                 mtp_runner->infer_next(mtp_prefix_token, past_len - 1);
                 mtp_prefix_token = -1;
             }
@@ -1510,27 +1368,28 @@ int main(int argc, char* argv[]) try {
             // [1] DRAFT PHASE: draft N tokens sequentially via MTP
             const std::vector<int64_t> drafts = mtp_runner->draft_n(next_id, past_len, N);
 
-            // [2] VERIFY PHASE: one main-model forward pass over N+1 tokens
-            // Input:  [next_id, drafts[0], ..., drafts[N-1]]
-            // Output: refs[0..N] (N+1 argmax token IDs); past_len += N+1 inside lambda
+            // [2] VERIFY PHASE: sequential single-token passes (M=1, same fast path as
+            // non-MTP decode). No GDA contamination — each step advances GDA state by
+            // exactly one token in the correct sequence order, so no save/restore needed.
             //
-            // Save GDA (linear attention) recurrent states before the verify pass.
-            // Qwen3.5 is a hybrid model with GDA layers whose recurrent state gets
-            // contaminated by rejected draft tokens. On reject, we restore the saved
-            // states and replay the committed tokens to recover correct GDA state.
-            const GDASnapshot gda_before_verify = save_linear_states();
-            const int64_t past_before_verify    = past_len;
-            const int64_t cur_next_id           = next_id;  // save for replay
-
-            const std::vector<int64_t> refs = run_main_verify(next_id, drafts);
-
-            // [3] ACCEPT / REJECT: find first mismatch (longest-prefix rule)
-            int j = N;
-            for (int k = 0; k < N; ++k) {
-                if (refs[k] != drafts[k]) { j = k; break; }
+            // Verify [next_id, drafts[0], ..., drafts[N-1]] one token at a time, stopping
+            // at the first mismatch. On full accept, run one extra pass to get the bonus token.
+            int j = N;  // first mismatch index; N means full accept
+            std::vector<int64_t> refs;
+            refs.reserve(static_cast<size_t>(N + 1));
+            int64_t token_to_verify = next_id;
+            for (int k = 0; k <= N; ++k) {
+                const int64_t ref_k = run_main_step(token_to_verify);
+                refs.push_back(ref_k);
+                if (k < N) {
+                    if (ref_k != drafts[k]) { j = k; break; }
+                    token_to_verify = drafts[k];
+                }
             }
+            // refs[0..j]: j+1 entries. refs[j] is correction (j<N) or bonus token (j==N).
+            // past_len incremented by j+1 inside run_main_step calls.
 
-            // Emit accepted draft tokens one by one (check stop and max_new_tokens per token)
+            // [3] ACCEPT / REJECT: emit accepted draft tokens then correction/bonus
             bool done = false;
             for (int k = 0; k < j; ++k) {
                 if (generated.size() >= static_cast<size_t>(opts.max_new_tokens)) { done = true; break; }
@@ -1539,7 +1398,6 @@ int main(int argc, char* argv[]) try {
                 ++accept_count;
                 if (!stop_token_ids.empty() && stop_token_ids.count(drafts[k]) > 0) { done = true; break; }
             }
-            // Always emit refs[j] (correction token if j < N, bonus token if j == N)
             if (!done && generated.size() < static_cast<size_t>(opts.max_new_tokens)) {
                 generated.push_back(refs[j]);
                 ++decode_steps;
@@ -1547,35 +1405,21 @@ int main(int argc, char* argv[]) try {
             }
             next_id = refs[j];
 
-            // [4] KV + GDA STATE MANAGEMENT
-            // past_len was incremented by N+1 inside run_main_verify.
-            // After trim: net past_len = past_len_before_verify + j + 1.
+            // [4] MTP KV STATE MANAGEMENT
+            // Main KV is already correct (sequential passes added exactly j+1 tokens).
+            // MTP KV: draft_n added N entries; we keep j+1 entries → trim N-j-1.
             if (j < N) {
-                // Partial accept or all-reject.
-                //
-                // GDA restore + replay: the batched verify pass contaminated the GDA
-                // recurrent states with rejected draft tokens.  Restore the pre-verify
-                // GDA states, roll back the KV to its pre-verify position, then replay
-                // the j+1 committed tokens to rebuild both KV and GDA correctly.
-                //
-                // trim_kv_main(N+1) — full rollback to past_before_verify
-                trim_kv_main(N + 1);          // past_len -= N+1  → past_len == past_before_verify
-                restore_linear_states(gda_before_verify);
-
-                // Replay [cur_next_id, drafts[0], ..., drafts[j-1]] (j+1 tokens).
-                // run_main_verify with empty drafts == 1-token single-step (j==0 case).
-                std::vector<int64_t> replay_drafts(drafts.begin(), drafts.begin() + j);
-                run_main_verify(cur_next_id, replay_drafts);
-                // past_len == past_before_verify + j + 1 ✓
-                // last_verify_hs updated from replay ✓
-
-                // MTP trim (same as before)
                 if (N - j - 1 > 0)
                     mtp_runner->trim_kv_cache(static_cast<size_t>(N - j - 1));
-                mtp_runner->inject_hidden_state_slice(last_verify_hs, static_cast<size_t>(j));
+                // Stage hidden state from last run_main_step for next draft_n.
+                // After sequential verify, text_request's "hidden_states" output is [1,1,H]
+                // (the hidden state at position past_len-1 = P+j).
+                const ov::Tensor last_hs = text_request.get_tensor("hidden_states");
+                mtp_runner->inject_hidden_state_slice(last_hs, 0);
             } else {
-                // Full accept + bonus: standard KV trim (0 for j==N), defer MTP sync.
-                trim_kv_main(N - j);  // == trim(0) — no-op
+                // Full accept: defer MTP KV sync to next iteration's step [0].
+                // text_request's "hidden_states" still holds h[P+N] from last run_main_step;
+                // infer_next in step [0] reads it via main_runner_ref_.
                 mtp_prefix_token = drafts[N - 1];
             }
 
