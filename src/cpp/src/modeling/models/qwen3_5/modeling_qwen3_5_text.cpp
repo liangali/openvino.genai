@@ -958,13 +958,15 @@ std::pair<Tensor, Tensor> Qwen3_5ForCausalLM::forward_with_hidden(
                                  cache_position,
                                  visual_embeds,
                                  visual_pos_mask);
-    // Slice to last token only: [B, T, H] → [B, 1, H].
-    // ops::slice(tensor, start, end, step, axis): axis=1 (token axis), start=-1, end=MAX.
-    auto last_hidden = ops::slice(hidden, -1, std::numeric_limits<int64_t>::max(), 1, 1);
-    // last_hidden shape: [B, 1, H] — verify in debugger before use.
-    // If shape is [B, H] (squeezed), adjust ops::slice axis or use ops::unsqueeze.
-    auto logits = lm_head_.forward(last_hidden);
-    return {logits, last_hidden};
+    // Compute logits over ALL positions [B, T, V] so that batched verify passes
+    // (input length M = N+1) return one logit row per input token.
+    // For single-token decode (T=1) this is identical to lm_head_.forward(hidden[:,-1:,:]).
+    auto logits = lm_head_.forward(hidden);
+    // Return full [B, T, H] hidden states so callers can extract any position's
+    // hidden vector via inject_hidden_state_slice(hidden, j). This is required by
+    // batched MTP verification: after a verify pass of M tokens, we need the hidden
+    // state at acceptance index j (0..M-1), not just the last one.
+    return {logits, hidden};
 }
 
 std::shared_ptr<ov::Model> create_qwen3_5_text_model(

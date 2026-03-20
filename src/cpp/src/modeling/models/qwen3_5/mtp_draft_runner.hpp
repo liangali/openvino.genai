@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 #include "openvino/runtime/infer_request.hpp"
 #include "utils.hpp"
@@ -36,6 +37,20 @@ public:
     // Reset all KV state (new sequence).
     void reset_state();
 
+    /// Draft N tokens sequentially.
+    /// Before calling: caller must call inject_hidden_state_slice() to set
+    /// main_runner_ref_ hidden_states to the single-token slice for position j
+    /// (or leave it as-is if coming from a single-token main-model step).
+    /// After return: MTP KV is at past_len + N.
+    std::vector<int64_t> draft_n(int64_t next_id, int64_t past_len, int N);
+
+    /// Extract position slice_idx from a [1, M, H] hidden_states tensor and
+    /// store it as a [1, 1, H] staging tensor (staged_hs_) so the next
+    /// infer_next / draft_n call feeds the correct hidden state to MTP.
+    /// Does NOT modify main_runner_ref_ — avoids corrupting the main model's
+    /// output tensor whose shape must remain [1, M, H] for subsequent verify passes.
+    void inject_hidden_state_slice(const ov::Tensor& multi_hs, size_t slice_idx);
+
     std::size_t get_num_processed_tokens() const { return num_processed_tokens_; }
 
 private:
@@ -46,6 +61,12 @@ private:
     ov::Tensor input_ids_buf_;
     ov::Tensor position_ids_buf_;
     ov::Tensor beam_idx_buf_;
+
+    // Staged single-token hidden state ([1, 1, H]) for the next infer_next call.
+    // Set by inject_hidden_state_slice() and consumed (cleared) by infer_next().
+    // Using a dedicated staging tensor avoids writing into the main model's output
+    // tensor (which would corrupt its shape for subsequent verify passes).
+    ov::Tensor staged_hs_;
 
     std::size_t num_processed_tokens_ = 0;
 };
