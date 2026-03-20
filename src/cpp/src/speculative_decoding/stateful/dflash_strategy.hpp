@@ -4,6 +4,7 @@
 #pragma once
 
 #include <filesystem>
+#include <map>
 #include <vector>
 
 #include "openvino/openvino.hpp"
@@ -69,6 +70,15 @@ private:
 
     // KV cache state
     ov::genai::utils::KVCacheState m_target_kv_state;
+
+    // Snapshot-based state selection (eliminates replay)
+    bool m_has_snapshots = false;
+    bool m_gpu_snapshots = false;  // true when GPU RemoteTensors are bound to snapshot outputs
+    ov::RemoteContext m_remote_context;
+    // Pre-allocated GPU buffers for snapshot outputs (keyed by snapshot port name)
+    std::map<std::string, ov::RemoteTensor> m_snapshot_remote_tensors;
+    // Pre-allocated GPU buffers for state restore (keyed by state name)
+    std::map<std::string, ov::RemoteTensor> m_state_remote_tensors;
 
     // Model paths (for debug)
     std::filesystem::path m_main_model_path;

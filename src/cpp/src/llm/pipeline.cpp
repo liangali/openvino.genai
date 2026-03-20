@@ -182,6 +182,48 @@ std::pair<std::string, Any> dflash_model(
     cfg.draft_model_path = draft_model_path;
     cfg.device = device;
     cfg.properties = properties;
+
+    // Helper: parse quantization mode string → QuantizationConfig
+    auto make_quant_cfg = [&](const std::string& mode_key, const std::string& gs_key)
+        -> std::optional<modeling::weights::QuantizationConfig> {
+        if (properties.count(mode_key) == 0) return std::nullopt;
+        auto mode_str = properties.at(mode_key).as<std::string>();
+        modeling::weights::QuantizationConfig qcfg;
+        if      (mode_str == "INT4_SYM")  qcfg.mode = modeling::weights::QuantizationConfig::Mode::INT4_SYM;
+        else if (mode_str == "INT4_ASYM") qcfg.mode = modeling::weights::QuantizationConfig::Mode::INT4_ASYM;
+        else if (mode_str == "INT8_SYM")  qcfg.mode = modeling::weights::QuantizationConfig::Mode::INT8_SYM;
+        else if (mode_str == "INT8_ASYM") qcfg.mode = modeling::weights::QuantizationConfig::Mode::INT8_ASYM;
+        else return std::nullopt;  // unknown mode → no quantization
+        qcfg.group_size = properties.count(gs_key) > 0
+            ? static_cast<int>(properties.at(gs_key).as<int64_t>())
+            : 128;
+        qcfg.backup_mode = qcfg.mode;  // same mode for all layers including lm_head
+        return qcfg;
+    };
+
+    // "quantization_mode" applies to both target and draft (backward compat).
+    auto both = make_quant_cfg("quantization_mode", "quantization_group_size");
+    if (both.has_value()) {
+        cfg.target_quantization_config = both;
+        cfg.draft_quantization_config  = both;
+    }
+
+    // Per-model overrides (take priority over combined key).
+    auto target_quant = make_quant_cfg("target_quantization_mode", "target_quantization_group_size");
+    if (target_quant.has_value()) cfg.target_quantization_config = target_quant;
+
+    auto draft_quant = make_quant_cfg("draft_quantization_mode", "draft_quantization_group_size");
+    if (draft_quant.has_value()) cfg.draft_quantization_config = draft_quant;
+
+    // Inference precision: "f32" or "f16" (default f16).
+    if (properties.count("inference_precision") > 0) {
+        auto prec_str = properties.at("inference_precision").as<std::string>();
+        if (prec_str == "f32" || prec_str == "FP32" || prec_str == "fp32")
+            cfg.inference_precision = ov::element::f32;
+        else
+            cfg.inference_precision = ov::element::f16;
+    }
+
     return { utils::DFLASH_MODEL_ARG_NAME, Any::make<utils::DFlashModelConfig>(cfg) };
 }
 
@@ -192,6 +234,15 @@ static std::unique_ptr<LLMPipelineImplBase> create(
     const ov::genai::Tokenizer& tokenizer,
     const std::string& device,
     const ov::AnyMap& properties) {
+    // DFlash reloads the target model from safetensors itself (with quantization applied).
+    // Skip the expensive read_model() here to avoid a redundant unquantized load.
+    if (properties.count(utils::DFLASH_MODEL_ARG_NAME)) {
+        auto props_copy = properties;
+        auto dflash_cfg = utils::extract_dflash_model_from_config(props_copy);
+        auto gen_config = utils::from_config_json_if_exists(models_path);
+        ModelDesc stub_desc(nullptr, tokenizer, device, props_copy, {}, gen_config);
+        return std::make_unique<StatefulDFlashPipeline>(stub_desc, dflash_cfg, models_path);
+    }
     return create(ov::genai::utils::read_model(models_path, properties),
                   tokenizer,
                   device,

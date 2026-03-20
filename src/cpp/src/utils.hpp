@@ -131,6 +131,16 @@ struct DFlashModelConfig {
     std::filesystem::path draft_model_path;
     std::string device;
     ov::AnyMap properties;
+
+    // Independent quantization configs for target and draft models.
+    // Use target_quantization_config to quantize only the target (Qwen3.5),
+    // draft_quantization_config to quantize only the draft, or set both.
+    std::optional<ov::genai::modeling::weights::QuantizationConfig> target_quantization_config;
+    std::optional<ov::genai::modeling::weights::QuantizationConfig> draft_quantization_config;
+
+    // Inference precision for compile_model (default: f16).
+    // Pass "f32" from Python to switch to full precision.
+    ov::element::Type inference_precision = ov::element::f16;
 };
 
 DFlashModelConfig extract_dflash_model_from_config(ov::AnyMap& config);

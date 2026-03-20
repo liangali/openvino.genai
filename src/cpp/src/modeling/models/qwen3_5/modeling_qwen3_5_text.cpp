@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <tuple>
 
 #include <openvino/core/except.hpp>
 #include <openvino/openvino.hpp>
@@ -71,6 +72,28 @@ bool use_fused_conv_op() {
         return true;  // enabled by default
     return std::string(raw) != "0";
 }
+
+bool use_state_snapshots() {
+    const char* raw = std::getenv("OV_GENAI_DISABLE_STATE_SNAPSHOTS");
+    if (raw && std::string(raw) == "1")
+        return false;
+    return true;  // enabled by default
+}
+
+// When set, forces snapshot outputs even in the normal (non-DFlash) model builder.
+// Used for benchmarking snapshot kernel overhead in isolation.
+bool force_state_snapshots() {
+    const char* raw = std::getenv("OV_GENAI_FORCE_STATE_SNAPSHOTS");
+    return raw && std::string(raw) == "1";
+}
+
+// Accumulator for snapshot outputs during model construction.
+// GatedDeltaNet::forward() pushes {name, output} pairs here when snapshots are enabled.
+struct SnapshotOutputAccumulator {
+    std::vector<std::pair<std::string, ov::Output<ov::Node>>> entries;
+    bool active = false;
+};
+static SnapshotOutputAccumulator g_snapshot_accumulator;
 
 ov::genai::modeling::models::Qwen3_5TextModelConfig apply_qwen3_5_layer_limit(
     const ov::genai::modeling::models::Qwen3_5TextModelConfig& input_cfg) {
@@ -473,14 +496,17 @@ Tensor Qwen3_5GatedDeltaNet::forward(const Tensor& hidden_states,
         // ── FusedConv op path: fuses Gather + Concat + GroupConv + SiLU + Slice ──
         auto conv_w_2d = conv1d_weight().reshape({conv_dim_, conv_kernel_size_}, false);
 
-        auto fused_result = ops::fused_conv(
-            mixed_qkv,                                     // [B, conv_dim, S]
-            conv_w_2d,                                      // [conv_dim, kernel_size]
-            beam_idx,                                       // [B]
-            conv_init,                                       // [B, conv_dim, kernel_size]
-            conv_var);
-
-        mixed_after_conv = fused_result.first;              // [B, conv_dim, S]
+        if (g_snapshot_accumulator.active) {
+            auto [conv_out, conv_state, conv_snap] = ops::fused_conv_with_snapshots(
+                mixed_qkv, conv_w_2d, beam_idx, conv_init, conv_var);
+            mixed_after_conv = conv_out;
+            g_snapshot_accumulator.entries.push_back(
+                {"snapshot." + conv_info.variable_id, conv_snap.output()});
+        } else {
+            auto fused_result = ops::fused_conv(
+                mixed_qkv, conv_w_2d, beam_idx, conv_init, conv_var);
+            mixed_after_conv = fused_result.first;
+        }
     } else {
         // ── Fallback: original decomposed path ──
         auto conv_read = std::make_shared<ov::op::v6::ReadValue>(conv_init.output(), conv_var);
@@ -536,8 +562,16 @@ Tensor Qwen3_5GatedDeltaNet::forward(const Tensor& hidden_states,
         // No ReadValue/Assign — LinearAttention manages the variable exclusively.
         // The GPU impl reads from variable memory (if set) or from recurrent_init (first iteration),
         // and writes updated state directly to variable memory.
-        auto la_result = ops::linear_attention(q_f32, k_f32, v_f32, beta, g, recurrent_init, recurrent_var);
-        core_attn_tensor = la_result.first;   // [B, S, num_v_heads, head_v_dim]
+        if (g_snapshot_accumulator.active) {
+            auto [attn_out, recur_state, recur_snap] = ops::linear_attention_with_snapshots(
+                q_f32, k_f32, v_f32, beta, g, recurrent_init, recurrent_var);
+            core_attn_tensor = attn_out;
+            g_snapshot_accumulator.entries.push_back(
+                {"snapshot." + recurrent_info.variable_id, recur_snap.output()});
+        } else {
+            auto la_result = ops::linear_attention(q_f32, k_f32, v_f32, beta, g, recurrent_init, recurrent_var);
+            core_attn_tensor = la_result.first;
+        }
     } else {
         // ── TensorIterator path (default) ──
         // Traditional ReadValue + Gather + Assign pattern for variable state management.
@@ -1092,6 +1126,20 @@ std::shared_ptr<ov::Model> create_qwen3_5_text_model(
         visual_pos_mask_ptr = &visual_pos_mask;
     }
 
+    // Optionally activate snapshot accumulation for kernel overhead benchmarking
+    const bool do_snapshots = force_state_snapshots() && use_state_snapshots()
+                              && use_fused_conv_op() && use_linear_attention_op();
+    if (do_snapshots) {
+        std::cout << "[Snapshots] FORCE_STATE_SNAPSHOTS=1: enabling snapshot outputs in normal model" << std::endl;
+        g_snapshot_accumulator.entries.clear();
+        g_snapshot_accumulator.active = true;
+    } else if (force_state_snapshots()) {
+        std::cout << "[Snapshots] FORCE_STATE_SNAPSHOTS=1 but preconditions not met:"
+                  << " use_state_snapshots=" << use_state_snapshots()
+                  << " use_fused_conv_op=" << use_fused_conv_op()
+                  << " use_linear_attention_op=" << use_linear_attention_op() << std::endl;
+    }
+
     Tensor logits;
     if (use_inputs_embeds) {
         logits = model.forward_embeds(inputs_embeds,
@@ -1106,9 +1154,25 @@ std::shared_ptr<ov::Model> create_qwen3_5_text_model(
         logits = model.forward(input_ids, position_ids, beam_idx, attention_mask, &attention_mask, nullptr, visual_embeds_ptr, visual_pos_mask_ptr);
     }
 
+    if (do_snapshots) {
+        g_snapshot_accumulator.active = false;
+    }
+
     auto result = std::make_shared<ov::op::v0::Result>(logits.output());
     set_name(result, Qwen3_5TextIO::kLogits);
-    auto ov_model = ctx.build_model({result->output(0)});
+
+    ov::OutputVector model_outputs = {result->output(0)};
+    if (do_snapshots) {
+        for (auto& [name, output] : g_snapshot_accumulator.entries) {
+            auto snap_result = std::make_shared<ov::op::v0::Result>(output);
+            set_name(snap_result, name);
+            model_outputs.push_back(snap_result->output(0));
+        }
+        std::cout << "[Snapshots] Added " << g_snapshot_accumulator.entries.size()
+                  << " snapshot outputs to model (total outputs: " << model_outputs.size() << ")" << std::endl;
+        g_snapshot_accumulator.entries.clear();
+    }
+    auto ov_model = ctx.build_model(model_outputs);
     ov_model->set_rt_info(ov::element::f16, {"runtime_options", ov::hint::kv_cache_precision.name()});
     ov_model->set_rt_info(8.0f, {"runtime_options", ov::hint::activations_scale_factor.name()});
     return ov_model;
@@ -1187,8 +1251,14 @@ std::shared_ptr<ov::Model> create_qwen3_5_dflash_target_model(
     auto position_ids = ctx.parameter(Qwen3_5TextIO::kPositionIds, ov::element::i64, ov::PartialShape{3, -1, -1});
     auto beam_idx = ctx.parameter(Qwen3_5TextIO::kBeamIdx, ov::element::i32, ov::PartialShape{-1});
 
+    // Enable snapshot accumulation during model construction
+    g_snapshot_accumulator.entries.clear();
+    g_snapshot_accumulator.active = use_state_snapshots() && use_fused_conv_op() && use_linear_attention_op();
+
     auto outputs = model.model().forward_with_selected_layers(
         input_ids, position_ids, beam_idx, attention_mask, &attention_mask, nullptr, target_layer_ids);
+
+    g_snapshot_accumulator.active = false;
 
     auto logits = model.lm_head().forward(outputs.first);
     auto hidden_out = outputs.second;
@@ -1198,7 +1268,18 @@ std::shared_ptr<ov::Model> create_qwen3_5_dflash_target_model(
     set_name(logits_result, "logits");
     set_name(hidden_result, "target_hidden");
 
-    auto ov_model = ctx.build_model({logits_result->output(0), hidden_result->output(0)});
+    ov::OutputVector model_outputs = {logits_result->output(0), hidden_result->output(0)};
+
+    // Add snapshot outputs as named model results
+    for (auto& [name, output] : g_snapshot_accumulator.entries) {
+        auto result = std::make_shared<ov::op::v0::Result>(output);
+        set_name(result, name);
+        model_outputs.push_back(result->output(0));
+    }
+    g_snapshot_accumulator.entries.clear();
+
+    auto ov_model = ctx.build_model(model_outputs);
+
     ov_model->set_rt_info(ov::element::f16, {"runtime_options", ov::hint::kv_cache_precision.name()});
     ov_model->set_rt_info(8.0f, {"runtime_options", ov::hint::activations_scale_factor.name()});
     return ov_model;

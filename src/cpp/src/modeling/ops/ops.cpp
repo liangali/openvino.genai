@@ -147,6 +147,31 @@ std::pair<Tensor, Tensor> linear_attention(const Tensor& q,
     return {Tensor(node->output(0), ctx), Tensor(node->output(1), ctx)};
 }
 
+std::tuple<Tensor, Tensor, Tensor> linear_attention_with_snapshots(
+                                           const Tensor& q,
+                                           const Tensor& k,
+                                           const Tensor& v,
+                                           const Tensor& beta,
+                                           const Tensor& g,
+                                           const Tensor& initial_state,
+                                           const std::shared_ptr<ov::op::util::Variable>& variable) {
+    auto* ctx = q.context();
+    const Tensor* inputs[] = {&k, &v, &beta, &g, &initial_state};
+    for (const auto* t : inputs) {
+        auto* t_ctx = t->context();
+        if (ctx && t_ctx && ctx != t_ctx) {
+            OPENVINO_THROW("Tensor contexts do not match");
+        }
+        if (!ctx) {
+            ctx = t_ctx;
+        }
+    }
+
+    ov::OutputVector args = {q.output(), k.output(), v.output(), g.output(), beta.output(), initial_state.output()};
+    auto node = std::make_shared<ov::op::LinearAttention>(args, variable, true);
+    return {Tensor(node->output(0), ctx), Tensor(node->output(1), ctx), Tensor(node->output(2), ctx)};
+}
+
 std::pair<Tensor, Tensor> fused_conv(const Tensor& input,
                                      const Tensor& conv_weight,
                                      const Tensor& beam_idx,
@@ -168,6 +193,30 @@ std::pair<Tensor, Tensor> fused_conv(const Tensor& input,
                              beam_idx.output(), initial_state.output()};
     auto node = std::make_shared<ov::op::FusedConv>(args, variable);
     return {Tensor(node->output(0), ctx), Tensor(node->output(1), ctx)};
+}
+
+std::tuple<Tensor, Tensor, Tensor> fused_conv_with_snapshots(
+                                     const Tensor& input,
+                                     const Tensor& conv_weight,
+                                     const Tensor& beam_idx,
+                                     const Tensor& initial_state,
+                                     const std::shared_ptr<ov::op::util::Variable>& variable) {
+    auto* ctx = input.context();
+    const Tensor* inputs[] = {&conv_weight, &beam_idx, &initial_state};
+    for (const auto* t : inputs) {
+        auto* t_ctx = t->context();
+        if (ctx && t_ctx && ctx != t_ctx) {
+            OPENVINO_THROW("Tensor contexts do not match");
+        }
+        if (!ctx) {
+            ctx = t_ctx;
+        }
+    }
+
+    ov::OutputVector args = {input.output(), conv_weight.output(),
+                             beam_idx.output(), initial_state.output()};
+    auto node = std::make_shared<ov::op::FusedConv>(args, variable, true);
+    return {Tensor(node->output(0), ctx), Tensor(node->output(1), ctx), Tensor(node->output(2), ctx)};
 }
 
 Tensor moe3gemm_fused_compressed(const Tensor& input,

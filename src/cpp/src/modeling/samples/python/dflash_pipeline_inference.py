@@ -259,17 +259,18 @@ def run_with_streaming(pipe, full_prompt, config):
     return result, metrics
 
 
-def run_dflash(model_dir, draft_dir, prompt, device, max_tokens, no_think):
+def run_dflash(model_dir, draft_dir, prompt, device, max_tokens, no_think, precision="f16"):
     print("=" * 60)
     print("DFlash speculative decoding")
     print("=" * 60)
     print(f"Target model : {model_dir}")
     print(f"Draft model  : {draft_dir}")
     print(f"Device       : {device}")
+    print(f"Precision    : {precision}")
     print(f"Max tokens   : {max_tokens}")
     print()
 
-    draft = openvino_genai.dflash_model(draft_dir, device)
+    draft = openvino_genai.dflash_model(draft_dir, device, inference_precision=precision)
     pipe = openvino_genai.LLMPipeline(model_dir, device, dflash_model=draft)
 
     config = openvino_genai.GenerationConfig()
@@ -307,17 +308,21 @@ def main():
     parser.add_argument("draft_model_dir", nargs="?", default=r"D:\Data\models\Huggingface\Qwen3.5-4B-DFlash-b16",
                         help="Path to DFlash draft model directory")
     parser.add_argument("prompt", nargs="?", default="who are you?", help="Input prompt text")
+
+    # parser.add_argument("prompt", nargs="?", default="Joy can read 8 pages of a book in 20 minutes. How many hours will it take her to read 120 pages?", help="Input prompt text")
     parser.add_argument("--device", default="GPU", help="OpenVINO device (default: GPU)")
     parser.add_argument("--max-tokens", type=int, default=1024, help="Max new tokens (default: 1024)")
     parser.add_argument("--no-think", action="store_true",
                         help="Skip thinking for Qwen3.5 (add no-think template)")
+    parser.add_argument("--precision", default="f16", choices=["f16", "f32"],
+                        help="Inference precision: f16 (default) or f32")
     parser.add_argument("--skip-baseline", action="store_true",
                         help="Skip baseline comparison")
     args = parser.parse_args()
 
     dflash_result, dflash_metrics = run_dflash(
         args.model_dir, args.draft_model_dir, args.prompt,
-        args.device, args.max_tokens, args.no_think)
+        args.device, args.max_tokens, args.no_think, args.precision)
 
     if not args.skip_baseline:
         baseline_result, baseline_metrics = run_baseline(
