@@ -141,7 +141,8 @@ public:
     Tensor forward(const Tensor& hidden_states,
                    const Tensor& beam_idx,
                    const Tensor* attention_mask,
-                   const Tensor* cache_position) const;
+                   const Tensor* cache_position,
+                   const Tensor* state_update_mode = nullptr) const;
 
 private:
     const Tensor& in_proj_qkv_weight() const;
@@ -219,6 +220,7 @@ public:
                                       const Tensor* linear_attention_mask,
                                       const Tensor* cache_position,
                                       const std::optional<Tensor>& residual,
+                                      const Tensor* state_update_mode = nullptr,
                                       const Tensor* precomputed_full_attn_sdpa_mask = nullptr) const;
 
 private:
@@ -242,7 +244,8 @@ public:
                    const Tensor* linear_attention_mask,
                    const Tensor* cache_position,
                    const Tensor* visual_embeds = nullptr,
-                   const Tensor* visual_pos_mask = nullptr);
+                   const Tensor* visual_pos_mask = nullptr,
+                   const Tensor* state_update_mode = nullptr);
     Tensor forward_embeds(const Tensor& inputs_embeds,
                           const Tensor& position_ids,
                           const Tensor& beam_idx,
@@ -250,7 +253,8 @@ public:
                           const Tensor* linear_attention_mask,
                           const Tensor* cache_position,
                           const Tensor* visual_embeds = nullptr,
-                          const Tensor* visual_pos_mask = nullptr);
+                          const Tensor* visual_pos_mask = nullptr,
+                          const Tensor* state_update_mode = nullptr);
 
     VocabEmbedding& embed_tokens();
 
@@ -261,6 +265,7 @@ public:
         const Tensor& full_attention_mask,
         const Tensor* linear_attention_mask,
         const Tensor* cache_position,
+        const Tensor* state_update_mode,
         const std::vector<int32_t>& layer_ids);
 
 private:
@@ -272,7 +277,8 @@ private:
                         const Tensor* linear_attention_mask,
                         const Tensor* cache_position,
                         const Tensor* visual_embeds,
-                        const Tensor* visual_pos_mask);
+                        const Tensor* visual_pos_mask,
+                        const Tensor* state_update_mode);
     std::pair<Tensor, Tensor> build_mrope_cos_sin(const Tensor& position_ids) const;
 
     Qwen3_5TextModelConfig cfg_;
@@ -296,7 +302,8 @@ public:
                    const Tensor* linear_attention_mask,
                    const Tensor* cache_position,
                    const Tensor* visual_embeds = nullptr,
-                   const Tensor* visual_pos_mask = nullptr);
+                   const Tensor* visual_pos_mask = nullptr,
+                   const Tensor* state_update_mode = nullptr);
     Tensor forward_embeds(const Tensor& inputs_embeds,
                           const Tensor& position_ids,
                           const Tensor& beam_idx,
@@ -304,7 +311,8 @@ public:
                           const Tensor* linear_attention_mask,
                           const Tensor* cache_position,
                           const Tensor* visual_embeds = nullptr,
-                          const Tensor* visual_pos_mask = nullptr);
+                          const Tensor* visual_pos_mask = nullptr,
+                          const Tensor* state_update_mode = nullptr);
 
     Qwen3_5Model& model() { return model_; }
     LMHead& lm_head() { return lm_head_; }

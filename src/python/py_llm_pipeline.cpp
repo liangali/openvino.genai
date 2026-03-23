@@ -293,5 +293,7 @@ void init_llm_pipeline(py::module_& m) {
         .def_readonly("target_decode_total_ms", &ov::genai::DFlashPerfMetrics::target_decode_total_ms)
         .def_readonly("avg_target_verify_ms",   &ov::genai::DFlashPerfMetrics::avg_target_verify_ms)
         .def_readonly("avg_target_replay_ms",   &ov::genai::DFlashPerfMetrics::avg_target_replay_ms)
-        .def_readonly("avg_target_decode_ms",   &ov::genai::DFlashPerfMetrics::avg_target_decode_ms);
+        .def_readonly("avg_target_decode_ms",   &ov::genai::DFlashPerfMetrics::avg_target_decode_ms)
+        .def_readonly("verify_trace_lines",     &ov::genai::DFlashPerfMetrics::verify_trace_lines)
+        .def_readonly("snapshot_restore_trace_lines", &ov::genai::DFlashPerfMetrics::snapshot_restore_trace_lines);
 }

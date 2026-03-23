@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <string>
 #include <vector>
 #include "openvino/genai/perf_metrics.hpp"
 
@@ -54,6 +55,11 @@ struct DFlashPerfMetrics : public ov::genai::ExtendedPerfMetrics {
     double avg_target_verify_ms = 0.0;
     double avg_target_replay_ms = 0.0;
     double avg_target_decode_ms = 0.0;
+
+    // Per-step trace lines mirrored from console logging so benchmark reports
+    // can persist the detailed verify / snapshot timings.
+    std::vector<std::string> verify_trace_lines;
+    std::vector<std::string> snapshot_restore_trace_lines;
 };
 
 }  // namespace genai

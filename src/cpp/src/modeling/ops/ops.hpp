@@ -39,7 +39,22 @@ std::pair<Tensor, Tensor> linear_attention(const Tensor& q,
                                            const Tensor& beta,
                                            const Tensor& g,
                                            const Tensor& initial_state,
+                                           const Tensor& state_update_mode);
+std::pair<Tensor, Tensor> linear_attention(const Tensor& q,
+                                           const Tensor& k,
+                                           const Tensor& v,
+                                           const Tensor& beta,
+                                           const Tensor& g,
+                                           const Tensor& initial_state,
                                            const std::shared_ptr<ov::op::util::Variable>& variable);
+std::pair<Tensor, Tensor> linear_attention(const Tensor& q,
+                                           const Tensor& k,
+                                           const Tensor& v,
+                                           const Tensor& beta,
+                                           const Tensor& g,
+                                           const Tensor& initial_state,
+                                           const std::shared_ptr<ov::op::util::Variable>& variable,
+                                           const Tensor& state_update_mode);
 std::tuple<Tensor, Tensor, Tensor> linear_attention_with_snapshots(
                                            const Tensor& q,
                                            const Tensor& k,
@@ -48,7 +63,28 @@ std::tuple<Tensor, Tensor, Tensor> linear_attention_with_snapshots(
                                            const Tensor& g,
                                            const Tensor& initial_state,
                                            const std::shared_ptr<ov::op::util::Variable>& variable);
+std::tuple<Tensor, Tensor, Tensor> linear_attention_with_snapshots(
+                                           const Tensor& q,
+                                           const Tensor& k,
+                                           const Tensor& v,
+                                           const Tensor& beta,
+                                           const Tensor& g,
+                                           const Tensor& initial_state,
+                                           const std::shared_ptr<ov::op::util::Variable>& variable,
+                                           const Tensor& state_update_mode);
 std::pair<Tensor, Tensor> fused_conv(const Tensor& input,
+                                     const Tensor& conv_weight,
+                                     const Tensor& beam_idx,
+                                     const Tensor& initial_state,
+                                     const std::shared_ptr<ov::op::util::Variable>& variable);
+std::pair<Tensor, Tensor> fused_conv(const Tensor& input,
+                                     const Tensor& conv_weight,
+                                     const Tensor& beam_idx,
+                                     const Tensor& initial_state,
+                                     const std::shared_ptr<ov::op::util::Variable>& variable,
+                                     const Tensor& state_update_mode);
+std::tuple<Tensor, Tensor, Tensor> fused_conv_with_snapshots(
+                                     const Tensor& input,
                                      const Tensor& conv_weight,
                                      const Tensor& beam_idx,
                                      const Tensor& initial_state,
@@ -58,7 +94,8 @@ std::tuple<Tensor, Tensor, Tensor> fused_conv_with_snapshots(
                                      const Tensor& conv_weight,
                                      const Tensor& beam_idx,
                                      const Tensor& initial_state,
-                                     const std::shared_ptr<ov::op::util::Variable>& variable);
+                                     const std::shared_ptr<ov::op::util::Variable>& variable,
+                                     const Tensor& state_update_mode);
 Tensor moe3gemm_fused_compressed(const Tensor& input,
                                  const Tensor& gate_inp_weight,
                                  const Tensor& gate_exps_weight,

@@ -5,9 +5,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <sstream>
 
 #include "dflash_perf_metrics.hpp"
 
@@ -54,6 +56,11 @@ ov::Tensor ensure_f32_copy(const ov::Tensor& t) {
     ov::Tensor out(ov::element::f32, t.get_shape());
     t.copy_to(out);
     return out;
+}
+
+bool deferred_state_commit_enabled_by_default() {
+    const char* raw = std::getenv("OV_GENAI_DISABLE_DFLASH_DEFERRED_STATE_COMMIT");
+    return !(raw && std::string(raw) == "1");
 }
 
 }  // namespace
@@ -145,6 +152,14 @@ StatefulDFlashPipeline::StatefulDFlashPipeline(
     m_embed_request = compiled_embed.create_infer_request();
     m_lm_head_request = compiled_lm_head.create_infer_request();
 
+    for (const auto& input : compiled_target.inputs()) {
+        const auto& names = input.get_names();
+        if (names.find("state_update_mode") != names.end()) {
+            m_has_state_update_mode_input = true;
+            break;
+        }
+    }
+
     m_target_request.reset_state();
 
     // Detect snapshot outputs (enables replay-free verify)
@@ -181,16 +196,6 @@ StatefulDFlashPipeline::StatefulDFlashPipeline(
                 auto dtype = output.get_element_type();
                 auto snap_remote = m_remote_context.create_tensor(dtype, snap_shape);
                 m_snapshot_remote_tensors[snap_name] = snap_remote;
-
-                // Pre-allocate GPU state buffer [B, 1, d1, d2, ...] (same rank as ROI)
-                std::string state_name = snap_name.substr(std::string("snapshot.").size());
-                ov::Shape state_shape;
-                state_shape.push_back(1);  // batch
-                state_shape.push_back(1);  // S=1 (matches ROI shape)
-                for (size_t d = 2; d < snap_shape.size(); ++d)
-                    state_shape.push_back(snap_shape[d]);
-                auto state_remote = m_remote_context.create_tensor(dtype, state_shape);
-                m_state_remote_tensors[state_name] = state_remote;
             }
             m_gpu_snapshots = !m_snapshot_remote_tensors.empty();
             if (m_gpu_snapshots) {
@@ -203,6 +208,15 @@ StatefulDFlashPipeline::StatefulDFlashPipeline(
                       << e.what() << std::endl;
             m_gpu_snapshots = false;
         }
+    }
+
+    m_use_deferred_state_commit = m_has_snapshots &&
+                                  m_has_state_update_mode_input &&
+                                  deferred_state_commit_enabled_by_default();
+    if (m_use_deferred_state_commit) {
+        std::cout << "[DFlash] Deferred state commit enabled for snapshot verify" << std::endl;
+    } else if (m_has_snapshots && !m_has_state_update_mode_input) {
+        std::cout << "[DFlash] Deferred state commit unavailable: target model has no state_update_mode input" << std::endl;
     }
 
     auto kv_pos = ov::genai::utils::get_kv_axes_pos(compiled_target.get_runtime_model());
@@ -243,6 +257,12 @@ ov::Tensor StatefulDFlashPipeline::make_beam_idx() const {
     ov::Tensor b(ov::element::i32, {1});
     b.data<int32_t>()[0] = 0;
     return b;
+}
+
+ov::Tensor StatefulDFlashPipeline::make_state_update_mode_tensor(int32_t mode) const {
+    ov::Tensor t(ov::element::i32, {1});
+    t.data<int32_t>()[0] = mode;
+    return t;
 }
 
 int64_t StatefulDFlashPipeline::argmax_last_token(const ov::Tensor& logits) const {
@@ -376,6 +396,8 @@ EncodedResults StatefulDFlashPipeline::generate(
     double stat_target_replay_total_ms = 0.0;
     size_t stat_target_verify_count = 0;
     size_t stat_target_replay_count = 0;
+    std::vector<std::string> verify_trace_lines;
+    std::vector<std::string> snapshot_restore_trace_lines;
 
     auto config = generation_config.has_value() ? *generation_config : m_generation_config;
     if (config.stop_token_ids.empty()) {
@@ -437,15 +459,27 @@ EncodedResults StatefulDFlashPipeline::generate(
     };
 
     auto beam_idx = make_beam_idx();
+    const bool use_deferred_snapshot_commit = m_use_deferred_state_commit;
+    // state_update_mode protocol:
+    //   > 0 : commit state normally (prefill / replay)
+    //   = 0 : don't commit state (verify with deferred commit)
+    //   < 0 : commit snapshot at index (-value - 1) then process without committing
+    auto set_target_state_update_mode = [&](int32_t mode) {
+        if (!m_has_state_update_mode_input)
+            return;
+        m_target_request.set_tensor("state_update_mode", make_state_update_mode_tensor(mode));
+    };
 
     // Reset target state
     m_target_request.reset_state();
+    m_pending_snapshot_commit_index = -1;
 
     // ── Prefill ──
     m_target_request.set_tensor("input_ids", make_ids_tensor(output_ids));
     m_target_request.set_tensor("attention_mask", make_attention_mask(output_ids.size()));
     m_target_request.set_tensor("position_ids", make_mrope_position_ids(0, output_ids.size()));
     m_target_request.set_tensor("beam_idx", beam_idx);
+    set_target_state_update_mode(1);
     m_target_request.infer();
 
     auto logits = m_target_request.get_tensor("logits");
@@ -549,6 +583,16 @@ EncodedResults StatefulDFlashPipeline::generate(
         m_target_request.set_tensor("attention_mask", make_attention_mask(target_hidden_len + verify_len));
         m_target_request.set_tensor("position_ids", make_mrope_position_ids(target_hidden_len, verify_len));
         m_target_request.set_tensor("beam_idx", beam_idx);
+        // Verify: if deferred + pending commit, send negative index to kernel.
+        // The kernel will commit snapshot[index] to variable state before processing.
+        if (use_deferred_snapshot_commit && m_pending_snapshot_commit_index >= 0) {
+            set_target_state_update_mode(-(m_pending_snapshot_commit_index + 1));
+            m_pending_snapshot_commit_index = -1;
+        } else if (use_deferred_snapshot_commit) {
+            set_target_state_update_mode(0);  // no commit, deferred
+        } else {
+            set_target_state_update_mode(1);  // normal commit
+        }
         auto t_set_tensor_end = Clock::now();
 
         m_target_request.infer();
@@ -570,18 +614,17 @@ EncodedResults StatefulDFlashPipeline::generate(
         stat_target_verify_total_ms += to_ms(verify_start, verify_end);
         ++stat_target_verify_count;
 
-        // Print per-step verify breakdown (first 5 steps + every 10th)
-        if (stat_target_verify_count <= 5 || stat_target_verify_count % 10 == 0) {
-            std::cout << "[Verify #" << stat_target_verify_count
-                      << " seq=" << verify_len << "]"
-                      << " save_states=" << std::fixed << std::setprecision(2) << to_ms(t_save_start, t_save_end) << "ms"
-                      << " set_tensor=" << to_ms(verify_start, t_set_tensor_end) << "ms"
-                      << " infer=" << to_ms(t_set_tensor_end, t_infer_end) << "ms"
-                      << " get_logits=" << to_ms(t_infer_end, t_get_logits_end) << "ms"
-                      << " argmax=" << to_ms(t_get_logits_end, t_argmax_end) << "ms"
-                      << " total=" << to_ms(verify_start, verify_end) << "ms"
-                      << std::endl;
-        }
+        std::ostringstream verify_trace;
+        verify_trace << std::fixed << std::setprecision(2)
+                     << "[Verify #" << stat_target_verify_count
+                     << " seq=" << verify_len << "]"
+                     << " save_states=" << to_ms(t_save_start, t_save_end) << "ms"
+                     << " set_tensor=" << to_ms(verify_start, t_set_tensor_end) << "ms"
+                     << " infer=" << to_ms(t_set_tensor_end, t_infer_end) << "ms"
+                     << " get_logits=" << to_ms(t_infer_end, t_get_logits_end) << "ms"
+                     << " argmax=" << to_ms(t_get_logits_end, t_argmax_end) << "ms"
+                     << " total=" << to_ms(verify_start, verify_end) << "ms";
+        verify_trace_lines.push_back(verify_trace.str());
 
         int64_t posterior_next = posterior[accepted];
         const size_t num_accepted = accepted + 1;
@@ -594,92 +637,20 @@ EncodedResults StatefulDFlashPipeline::generate(
         // Dense-style vs hybrid-style acceptance handling:
         const bool all_accepted = (accepted == draft_tokens.size());
         const bool has_linear_states = m_has_snapshots || !saved_linear.empty();
+        const bool use_snapshot_restore = m_has_snapshots &&
+                                          has_linear_states &&
+                                          num_accepted > 0 &&
+                                          (!all_accepted || use_deferred_snapshot_commit);
 
-        if (all_accepted) {
-            // Full-block acceptance: KV cache and all states are clean — no rejected tokens.
-            target_hidden_block = ensure_f32_copy(m_target_request.get_tensor("target_hidden"));
-        } else if (m_has_snapshots && has_linear_states && num_accepted > 0) {
-            // Snapshot-based state selection (Path B): read per-step snapshots and select
-            // the state at num_accepted-1. No restore + replay needed.
-            auto t_snap_start = Clock::now();
+        if (use_snapshot_restore) {
+            // Index-based snapshot commit: record accepted step for next verify.
+            // The kernel will read snapshot[step] from the persistent GPU buffer
+            // and write it to the variable state at the start of the next infer.
+            // No external copy or set_state needed — everything stays on GPU.
             const size_t step = num_accepted - 1;
-            size_t snap_count = 0;
+            m_pending_snapshot_commit_index = static_cast<int32_t>(step);
 
-            if (m_gpu_snapshots) {
-                // GPU ROI path: snapshot stays on GPU, ROI extracts only the step K slice
-                // to a host tensor (~150KB), then set_state sends it back to GPU.
-                // This avoids the full 111MB GPU→Host copy of get_tensor().
-                // Note: We can't do pure GPU→GPU because set_state's convert_and_copy
-                // uses mem_lock when transpose is required, causing 48x GPU sync storms.
-                for (auto& state : m_target_request.query_state()) {
-                    const auto& name = state.get_name();
-                    if (name.find("linear_states.") == std::string::npos) continue;
-                    const std::string snap_name = "snapshot." + name;
-                    auto snap_it = m_snapshot_remote_tensors.find(snap_name);
-                    if (snap_it == m_snapshot_remote_tensors.end()) continue;
-
-                    auto& snap_remote = snap_it->second;
-                    auto snap_shape = snap_remote.get_shape();  // [B, S, d1, d2, ...]
-                    auto dtype = snap_remote.get_element_type();
-
-                    // ROI view for step K on GPU (zero-copy view)
-                    ov::Coordinate roi_begin(snap_shape.size(), 0);
-                    ov::Coordinate roi_end = snap_shape;
-                    roi_begin[1] = step;
-                    roi_end[1] = step + 1;
-                    ov::RemoteTensor roi_view(snap_remote, roi_begin, roi_end);
-
-                    // Host tensor with ROI shape [B, 1, d1, d2, ...] — only ~150KB
-                    ov::Shape roi_shape = snap_shape;
-                    roi_shape[1] = 1;
-                    ov::Tensor host_slice(dtype, roi_shape);
-
-                    // GPU→Host copy of ONLY the step K slice
-                    roi_view.copy_to(host_slice);
-
-                    // Reshape to [B, d1, d2, ...] for set_state
-                    ov::Shape state_shape;
-                    state_shape.push_back(snap_shape[0]);
-                    for (size_t d = 2; d < snap_shape.size(); ++d)
-                        state_shape.push_back(snap_shape[d]);
-                    host_slice.set_shape(state_shape);
-
-                    state.set_state(host_slice);
-                    ++snap_count;
-                }
-            } else {
-                // Host fallback: GPU→Host copy via get_tensor(), memcpy slice, Host→GPU set_state
-                for (auto& state : m_target_request.query_state()) {
-                    const auto& name = state.get_name();
-                    if (name.find("linear_states.") == std::string::npos) continue;
-                    const std::string snap_name = "snapshot." + name;
-                    try {
-                        auto snap = m_target_request.get_tensor(snap_name);
-                        auto snap_shape = snap.get_shape();
-                        auto dtype = snap.get_element_type();
-                        size_t elem_size = dtype.size();
-                        ov::Shape state_shape;
-                        state_shape.push_back(snap_shape[0]);
-                        for (size_t d = 2; d < snap_shape.size(); ++d)
-                            state_shape.push_back(snap_shape[d]);
-                        size_t per_step_elements = 1;
-                        for (size_t d = 2; d < snap_shape.size(); ++d)
-                            per_step_elements *= snap_shape[d];
-                        size_t S = snap_shape[1];
-                        ov::Tensor state_tensor(dtype, state_shape);
-                        auto src = static_cast<const uint8_t*>(snap.data());
-                        auto dst = static_cast<uint8_t*>(state_tensor.data());
-                        for (size_t b = 0; b < snap_shape[0]; ++b) {
-                            size_t src_off = ((b * S + step) * per_step_elements) * elem_size;
-                            size_t dst_off = (b * per_step_elements) * elem_size;
-                            std::memcpy(dst + dst_off, src + src_off, per_step_elements * elem_size);
-                        }
-                        state.set_state(state_tensor);
-                        ++snap_count;
-                    } catch (...) {}
-                }
-            }
-            auto t_snap_select_end = Clock::now();
+            auto t_snap_start = Clock::now();
             // Trim only rejected tokens from KV tail
             const size_t tokens_to_trim = verify_len - num_accepted;
             m_target_kv_state.num_tokens_to_trim = tokens_to_trim;
@@ -689,15 +660,16 @@ EncodedResults StatefulDFlashPipeline::generate(
             target_hidden_block = ensure_f32_copy(m_target_request.get_tensor("target_hidden"));
             auto t_hidden_end = Clock::now();
 
-            if (stat_target_verify_count <= 5 || stat_target_verify_count % 10 == 0) {
-                std::cout << "[Snapshot restore #" << stat_target_verify_count
-                          << " step=" << step << " states=" << snap_count
-                          << (m_gpu_snapshots ? " GPU" : " Host") << "]"
-                          << " snap_select=" << std::fixed << std::setprecision(2) << to_ms(t_snap_start, t_snap_select_end) << "ms"
-                          << " trim_kv=" << to_ms(t_snap_select_end, t_trim_end) << "ms"
-                          << " get_hidden=" << to_ms(t_trim_end, t_hidden_end) << "ms"
-                          << std::endl;
-            }
+            std::ostringstream snapshot_restore_trace;
+            snapshot_restore_trace << std::fixed << std::setprecision(2)
+                                   << "[Snapshot deferred #" << stat_target_verify_count
+                                   << " commit_idx=" << step << "]"
+                                   << " trim_kv=" << to_ms(t_snap_start, t_trim_end) << "ms"
+                                   << " get_hidden=" << to_ms(t_trim_end, t_hidden_end) << "ms";
+            snapshot_restore_trace_lines.push_back(snapshot_restore_trace.str());
+        } else if (all_accepted) {
+            // Full-block acceptance: KV cache and all states are clean — no rejected tokens.
+            target_hidden_block = ensure_f32_copy(m_target_request.get_tensor("target_hidden"));
         } else if (!has_linear_states) {
             // No linear/recurrent states (pure dense model like Qwen3):
             // trim only rejected tokens from KV tail; hidden[0..accepted-1] are correct.
@@ -725,6 +697,7 @@ EncodedResults StatefulDFlashPipeline::generate(
                 m_target_request.set_tensor("attention_mask", make_attention_mask(target_hidden_len + num_accepted));
                 m_target_request.set_tensor("position_ids", make_mrope_position_ids(target_hidden_len, num_accepted));
                 m_target_request.set_tensor("beam_idx", beam_idx);
+                set_target_state_update_mode(1);
                 m_target_request.infer();
             } 
 
@@ -733,14 +706,6 @@ EncodedResults StatefulDFlashPipeline::generate(
             stat_target_replay_total_ms += to_ms(replay_start, replay_end);
             ++stat_target_replay_count;
 
-            if (stat_target_replay_count <= 5 || stat_target_replay_count % 10 == 0) {
-                std::cout << "[Replay #" << stat_target_replay_count
-                          << " accepted=" << num_accepted << "]"
-                          << " restore_states=" << std::fixed << std::setprecision(2) << to_ms(t_restore_start, t_restore_end) << "ms"
-                          << " trim_kv=" << to_ms(t_restore_end, t_trim_end) << "ms"
-                          << " replay_infer=" << to_ms(replay_start, replay_end) << "ms"
-                          << std::endl;
-            }
         }
 
         if (num_accepted > 0 && target_hidden_len + num_accepted <= max_length + m_block_size) {
@@ -813,6 +778,8 @@ EncodedResults StatefulDFlashPipeline::generate(
     dflash_metrics->avg_target_decode_ms   = dflash_metrics->target_decode_count > 0
         ? dflash_metrics->target_decode_total_ms / static_cast<double>(dflash_metrics->target_decode_count)
         : 0.0;
+    dflash_metrics->verify_trace_lines     = std::move(verify_trace_lines);
+    dflash_metrics->snapshot_restore_trace_lines = std::move(snapshot_restore_trace_lines);
 
     EncodedResults results;
     results.tokens.resize(1);
@@ -828,6 +795,7 @@ void StatefulDFlashPipeline::start_chat(const std::string& system_message) {
 
 void StatefulDFlashPipeline::finish_chat() {
     m_target_request.reset_state();
+    m_pending_snapshot_commit_index = -1;
 }
 
 }  // namespace genai

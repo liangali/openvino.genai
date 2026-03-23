@@ -456,9 +456,13 @@ Tensor Qwen3_5GatedDeltaNet::rms_norm_gated(const Tensor& x, const Tensor& z) co
 Tensor Qwen3_5GatedDeltaNet::forward(const Tensor& hidden_states,
                                        const Tensor& beam_idx,
                                        const Tensor* attention_mask,
-                                       const Tensor* cache_position) const {
+                                       const Tensor* cache_position,
+                                       const Tensor* state_update_mode) const {
     (void)cache_position;
     auto* op_ctx = hidden_states.context();
+    Tensor state_update_mode_tensor = state_update_mode
+        ? *state_update_mode
+        : Tensor(ops::const_vec(op_ctx, std::vector<int32_t>{1}), op_ctx);
 
     Tensor masked_hidden = hidden_states;
     if (attention_mask) {
@@ -498,13 +502,13 @@ Tensor Qwen3_5GatedDeltaNet::forward(const Tensor& hidden_states,
 
         if (g_snapshot_accumulator.active) {
             auto [conv_out, conv_state, conv_snap] = ops::fused_conv_with_snapshots(
-                mixed_qkv, conv_w_2d, beam_idx, conv_init, conv_var);
+                mixed_qkv, conv_w_2d, beam_idx, conv_init, conv_var, state_update_mode_tensor);
             mixed_after_conv = conv_out;
             g_snapshot_accumulator.entries.push_back(
                 {"snapshot." + conv_info.variable_id, conv_snap.output()});
         } else {
             auto fused_result = ops::fused_conv(
-                mixed_qkv, conv_w_2d, beam_idx, conv_init, conv_var);
+                mixed_qkv, conv_w_2d, beam_idx, conv_init, conv_var, state_update_mode_tensor);
             mixed_after_conv = fused_result.first;
         }
     } else {
@@ -564,12 +568,12 @@ Tensor Qwen3_5GatedDeltaNet::forward(const Tensor& hidden_states,
         // and writes updated state directly to variable memory.
         if (g_snapshot_accumulator.active) {
             auto [attn_out, recur_state, recur_snap] = ops::linear_attention_with_snapshots(
-                q_f32, k_f32, v_f32, beta, g, recurrent_init, recurrent_var);
+                q_f32, k_f32, v_f32, beta, g, recurrent_init, recurrent_var, state_update_mode_tensor);
             core_attn_tensor = attn_out;
             g_snapshot_accumulator.entries.push_back(
                 {"snapshot." + recurrent_info.variable_id, recur_snap.output()});
         } else {
-            auto la_result = ops::linear_attention(q_f32, k_f32, v_f32, beta, g, recurrent_init, recurrent_var);
+            auto la_result = ops::linear_attention(q_f32, k_f32, v_f32, beta, g, recurrent_init, recurrent_var, state_update_mode_tensor);
             core_attn_tensor = la_result.first;
         }
     } else {
@@ -684,6 +688,7 @@ std::pair<Tensor, Tensor> Qwen3_5DecoderLayer::forward(const Tensor& hidden_stat
                                                          const Tensor* linear_attention_mask,
                                                          const Tensor* cache_position,
                                                          const std::optional<Tensor>& residual,
+                                                         const Tensor* state_update_mode,
                                                          const Tensor* precomputed_full_attn_sdpa_mask) const {
     Tensor normed;
     Tensor next_residual;
@@ -705,7 +710,7 @@ std::pair<Tensor, Tensor> Qwen3_5DecoderLayer::forward(const Tensor& hidden_stat
                                     full_attention_mask,
                                     precomputed_full_attn_sdpa_mask);
     } else {
-        mixed = linear_attn_->forward(normed, beam_idx, linear_attention_mask, cache_position);
+        mixed = linear_attn_->forward(normed, beam_idx, linear_attention_mask, cache_position, state_update_mode);
     }
 
     auto post = post_attention_layernorm_.forward(mixed, next_residual);
@@ -793,7 +798,8 @@ Tensor Qwen3_5Model::forward_impl(const Tensor* input_ids,
                                   const Tensor* linear_attention_mask,
                                   const Tensor* cache_position,
                                   const Tensor* visual_embeds,
-                                  const Tensor* visual_pos_mask) {
+                                  const Tensor* visual_pos_mask,
+                                  const Tensor* state_update_mode) {
     OPENVINO_ASSERT((input_ids != nullptr) || (inputs_embeds != nullptr),
                     "Either input_ids or inputs_embeds must be provided");
     OPENVINO_ASSERT(!(input_ids != nullptr && inputs_embeds != nullptr),
@@ -871,6 +877,7 @@ Tensor Qwen3_5Model::forward_impl(const Tensor* input_ids,
                                  linear_mask,
                                  cache_position,
                                  residual,
+                                 state_update_mode,
                                  &shared_full_attn_sdpa_mask);
         hidden_states = out.first;
         residual = out.second;
@@ -889,7 +896,8 @@ Tensor Qwen3_5Model::forward(const Tensor& input_ids,
                              const Tensor* linear_attention_mask,
                              const Tensor* cache_position,
                              const Tensor* visual_embeds,
-                             const Tensor* visual_pos_mask) {
+                             const Tensor* visual_pos_mask,
+                             const Tensor* state_update_mode) {
     return forward_impl(&input_ids,
                         nullptr,
                         position_ids,
@@ -898,7 +906,8 @@ Tensor Qwen3_5Model::forward(const Tensor& input_ids,
                         linear_attention_mask,
                         cache_position,
                         visual_embeds,
-                        visual_pos_mask);
+                        visual_pos_mask,
+                        state_update_mode);
 }
 
 Tensor Qwen3_5Model::forward_embeds(const Tensor& inputs_embeds,
@@ -908,7 +917,8 @@ Tensor Qwen3_5Model::forward_embeds(const Tensor& inputs_embeds,
                                     const Tensor* linear_attention_mask,
                                     const Tensor* cache_position,
                                     const Tensor* visual_embeds,
-                                    const Tensor* visual_pos_mask) {
+                                    const Tensor* visual_pos_mask,
+                                    const Tensor* state_update_mode) {
     return forward_impl(nullptr,
                         &inputs_embeds,
                         position_ids,
@@ -917,7 +927,8 @@ Tensor Qwen3_5Model::forward_embeds(const Tensor& inputs_embeds,
                         linear_attention_mask,
                         cache_position,
                         visual_embeds,
-                        visual_pos_mask);
+                        visual_pos_mask,
+                        state_update_mode);
 }
 
 VocabEmbedding& Qwen3_5Model::embed_tokens() {
@@ -941,7 +952,8 @@ Tensor Qwen3_5ForCausalLM::forward(const Tensor& input_ids,
                                    const Tensor* linear_attention_mask,
                                    const Tensor* cache_position,
                                    const Tensor* visual_embeds,
-                                   const Tensor* visual_pos_mask) {
+                                   const Tensor* visual_pos_mask,
+                                   const Tensor* state_update_mode) {
     auto hidden = model_.forward(input_ids,
                                  position_ids,
                                  beam_idx,
@@ -949,7 +961,8 @@ Tensor Qwen3_5ForCausalLM::forward(const Tensor& input_ids,
                                  linear_attention_mask,
                                  cache_position,
                                  visual_embeds,
-                                 visual_pos_mask);
+                                 visual_pos_mask,
+                                 state_update_mode);
     return lm_head_.forward(hidden);
 }
 
@@ -960,7 +973,8 @@ Tensor Qwen3_5ForCausalLM::forward_embeds(const Tensor& inputs_embeds,
                                           const Tensor* linear_attention_mask,
                                           const Tensor* cache_position,
                                           const Tensor* visual_embeds,
-                                          const Tensor* visual_pos_mask) {
+                                          const Tensor* visual_pos_mask,
+                                          const Tensor* state_update_mode) {
     auto hidden = model_.forward_embeds(inputs_embeds,
                                         position_ids,
                                         beam_idx,
@@ -968,7 +982,8 @@ Tensor Qwen3_5ForCausalLM::forward_embeds(const Tensor& inputs_embeds,
                                         linear_attention_mask,
                                         cache_position,
                                         visual_embeds,
-                                        visual_pos_mask);
+                                        visual_pos_mask,
+                                        state_update_mode);
     return lm_head_.forward(hidden);
 }
 
@@ -979,6 +994,7 @@ std::pair<Tensor, Tensor> Qwen3_5Model::forward_with_selected_layers(
     const Tensor& full_attention_mask,
     const Tensor* linear_attention_mask,
     const Tensor* cache_position,
+    const Tensor* state_update_mode,
     const std::vector<int32_t>& layer_ids) {
     auto hidden_states = embed_tokens_.forward(input_ids);
     auto cos_sin = build_mrope_cos_sin(position_ids);
@@ -1019,6 +1035,7 @@ std::pair<Tensor, Tensor> Qwen3_5Model::forward_with_selected_layers(
                                       linear_mask,
                                       cache_position,
                                       residual,
+                                      state_update_mode,
                                       &shared_full_attn_sdpa_mask);
         hidden_states = out.first;
         residual = out.second;
@@ -1250,13 +1267,14 @@ std::shared_ptr<ov::Model> create_qwen3_5_dflash_target_model(
     auto attention_mask = ctx.parameter(Qwen3_5TextIO::kAttentionMask, ov::element::i64, ov::PartialShape{-1, -1});
     auto position_ids = ctx.parameter(Qwen3_5TextIO::kPositionIds, ov::element::i64, ov::PartialShape{3, -1, -1});
     auto beam_idx = ctx.parameter(Qwen3_5TextIO::kBeamIdx, ov::element::i32, ov::PartialShape{-1});
+    auto state_update_mode = ctx.parameter("state_update_mode", ov::element::i32, ov::PartialShape{1});
 
     // Enable snapshot accumulation during model construction
     g_snapshot_accumulator.entries.clear();
     g_snapshot_accumulator.active = use_state_snapshots() && use_fused_conv_op() && use_linear_attention_op();
 
     auto outputs = model.model().forward_with_selected_layers(
-        input_ids, position_ids, beam_idx, attention_mask, &attention_mask, nullptr, target_layer_ids);
+        input_ids, position_ids, beam_idx, attention_mask, &attention_mask, nullptr, &state_update_mode, target_layer_ids);
 
     g_snapshot_accumulator.active = false;
 

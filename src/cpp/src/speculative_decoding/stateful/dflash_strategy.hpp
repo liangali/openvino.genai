@@ -74,11 +74,12 @@ private:
     // Snapshot-based state selection (eliminates replay)
     bool m_has_snapshots = false;
     bool m_gpu_snapshots = false;  // true when GPU RemoteTensors are bound to snapshot outputs
+    bool m_has_state_update_mode_input = false;
+    bool m_use_deferred_state_commit = false;
+    int32_t m_pending_snapshot_commit_index = -1;  // -1 = no pending commit
     ov::RemoteContext m_remote_context;
     // Pre-allocated GPU buffers for snapshot outputs (keyed by snapshot port name)
     std::map<std::string, ov::RemoteTensor> m_snapshot_remote_tensors;
-    // Pre-allocated GPU buffers for state restore (keyed by state name)
-    std::map<std::string, ov::RemoteTensor> m_state_remote_tensors;
 
     // Model paths (for debug)
     std::filesystem::path m_main_model_path;
@@ -92,6 +93,7 @@ private:
     ov::Tensor make_attention_mask(size_t len) const;
     ov::Tensor make_mrope_position_ids(size_t start, size_t count) const;
     ov::Tensor make_beam_idx() const;
+    ov::Tensor make_state_update_mode_tensor(int32_t mode) const;
 
     int64_t argmax_last_token(const ov::Tensor& logits) const;
     std::vector<int64_t> argmax_logits_slice(const ov::Tensor& logits, size_t start, size_t count) const;

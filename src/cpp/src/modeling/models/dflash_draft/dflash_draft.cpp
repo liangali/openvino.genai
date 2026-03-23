@@ -121,14 +121,10 @@ Tensor DFlashAttention::forward(const Tensor& target_hidden,
                                 const Tensor& hidden_states,
                                 const Tensor& rope_cos,
                                 const Tensor& rope_sin) const {
+    auto kv_input = ops::concat({target_hidden, hidden_states}, 1);
     auto q = add_bias_if_present(ops::linear(hidden_states, q_proj_weight()), q_proj_bias());
-    auto k_ctx = add_bias_if_present(ops::linear(target_hidden, k_proj_weight()), k_proj_bias());
-    auto k_noise = add_bias_if_present(ops::linear(hidden_states, k_proj_weight()), k_proj_bias());
-    auto v_ctx = add_bias_if_present(ops::linear(target_hidden, v_proj_weight()), v_proj_bias());
-    auto v_noise = add_bias_if_present(ops::linear(hidden_states, v_proj_weight()), v_proj_bias());
-
-    auto k = ops::concat({k_ctx, k_noise}, 1);
-    auto v = ops::concat({v_ctx, v_noise}, 1);
+    auto k = add_bias_if_present(ops::linear(kv_input, k_proj_weight()), k_proj_bias());
+    auto v = add_bias_if_present(ops::linear(kv_input, v_proj_weight()), v_proj_bias());
 
     auto q_heads = q.reshape({0, 0, num_heads_, head_dim_}).permute({0, 2, 1, 3});
     auto k_heads = k.reshape({0, 0, num_kv_heads_, head_dim_}).permute({0, 2, 1, 3});
