@@ -220,7 +220,7 @@ set_target_properties(modeling_dflash PROPERTIES
 
 # Qwen3.5 DFlash sample
 add_executable(modeling_qwen3_5_dflash
-    cpp/modeling_qwen3_5_dflash.cpp
+    modeling_qwen3_5_dflash.cpp
     $<TARGET_OBJECTS:openvino_genai_obj>)
 
 target_include_directories(modeling_qwen3_5_dflash PRIVATE

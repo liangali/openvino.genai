@@ -670,6 +670,49 @@ void trim_kv_cache(ov::InferRequest request, KVCacheState& kv_cache_state, std::
 
     OPENVINO_ASSERT(states.size() > 0, "Request contains no states.");
 
+    // Try GPU-optimized in-place trim first (zero-copy buffer reinterpretation).
+    // All states from the same InferRequest share one plugin, so if the first
+    // KV state supports set_shape(), all of them do.
+    try {
+        for (auto& state : states) {
+            if (adapter_controller && adapter_controller->has_state_name(state.get_name()))
+                continue;
+
+            if (!is_attention_kv_state_name(state.get_name()))
+                continue;
+
+            auto shape = state.get_shape();
+            if (kv_cache_state.seq_length_axis >= shape.size())
+                continue;
+
+            const size_t seq_axis = kv_cache_state.seq_length_axis;
+            const size_t old_seq_len = shape[seq_axis];
+            const size_t trim = std::min<size_t>(old_seq_len, kv_cache_state.num_tokens_to_trim);
+            if (trim == 0)
+                continue;
+
+            shape[seq_axis] = old_seq_len - trim;
+            state.set_shape(shape);
+        }
+        return;  // GPU-optimized trim succeeded
+    } catch (const ov::NotImplemented& e) {
+        // set_shape() not supported by this plugin — fall through to CPU path
+        static bool warned = false;
+        if (!warned) {
+            std::cerr << "[trim_kv] GPU zero-copy path not available (" << e.what()
+                      << "), falling back to CPU copy path.\n";
+            warned = true;
+        }
+    } catch (const std::exception& e) {
+        static bool warned2 = false;
+        if (!warned2) {
+            std::cerr << "[trim_kv] GPU path failed with exception: " << e.what()
+                      << ", falling back to CPU copy path.\n";
+            warned2 = true;
+        }
+    }
+
+    // CPU fallback: read state from device, trim on host, write back.
     for (auto& state : states) {
         if(adapter_controller && adapter_controller->has_state_name(state.get_name()))
             continue;
