@@ -334,7 +334,8 @@ std::shared_ptr<ov::Model> create_qwen3_5_dflash_target_model(
     const Qwen3_5Config& cfg,
     const std::vector<int32_t>& target_layer_ids,
     ov::genai::modeling::weights::WeightSource& source,
-    ov::genai::modeling::weights::WeightFinalizer& finalizer);
+    ov::genai::modeling::weights::WeightFinalizer& finalizer,
+    int32_t snapshot_block_size = 0);
 
 std::shared_ptr<ov::Model> create_qwen3_5_embedding_model(
     const Qwen3_5Config& cfg,
@@ -346,6 +347,14 @@ std::shared_ptr<ov::Model> create_qwen3_5_lm_head_model(
     ov::genai::modeling::weights::WeightSource& source,
     ov::genai::modeling::weights::WeightFinalizer& finalizer,
     const ov::element::Type& input_type = ov::element::f32);
+
+/// Combined embed_tokens + lm_head model for DFlash draft helper.
+/// Two InferRequests from the same CompiledModel share GPU weight memory.
+std::shared_ptr<ov::Model> create_qwen3_5_draft_helper_model(
+    const Qwen3_5Config& cfg,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer,
+    const ov::element::Type& lm_head_input_type = ov::element::f32);
 
 }  // namespace models
 }  // namespace modeling

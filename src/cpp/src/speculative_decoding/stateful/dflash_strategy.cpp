@@ -121,15 +121,12 @@ StatefulDFlashPipeline::StatefulDFlashPipeline(
         target_finalizer = safetensors::SafetensorsWeightFinalizer(dflash_cfg.target_quantization_config.value());
     if (dflash_cfg.draft_quantization_config.has_value())
         draft_finalizer  = safetensors::SafetensorsWeightFinalizer(dflash_cfg.draft_quantization_config.value());
-
-    // Build 4 sub-models
     auto target_model = modeling::models::create_qwen3_5_dflash_target_model(
-        target_qwen35_cfg, m_target_layer_ids, target_source, target_finalizer);
+        target_qwen35_cfg, m_target_layer_ids, target_source, target_finalizer, m_block_size);
     auto draft_model = modeling::models::create_dflash_draft_model(
         dc, draft_source, draft_finalizer, ov::element::f32);
-    auto embed_model = modeling::models::create_qwen3_5_embedding_model(
-        target_qwen35_cfg, target_source, target_finalizer);
-    auto lm_head_model = modeling::models::create_qwen3_5_lm_head_model(
+        // Draft helper model (for combined embed + lm_head path in draft)
+    auto draft_helper_model = modeling::models::create_qwen3_5_draft_helper_model(
         target_qwen35_cfg, target_source, target_finalizer, ov::element::f32);
 
     // Compile
@@ -142,15 +139,32 @@ StatefulDFlashPipeline::StatefulDFlashPipeline(
         compile_cfg[ov::hint::activations_scale_factor.name()] = 8.0f;
     }
 
+    std::cerr << "[DFlash GPU MEM] Compiling target model..." << std::endl;
     auto compiled_target = core.compile_model(target_model, device, compile_cfg);
+    std::cerr << "[DFlash GPU MEM] Target compiled." << std::endl;
+
+    std::cerr << "[DFlash GPU MEM] Compiling draft model..." << std::endl;
     auto compiled_draft = core.compile_model(draft_model, device, compile_cfg);
-    auto compiled_embed = core.compile_model(embed_model, device, compile_cfg);
-    auto compiled_lm_head = core.compile_model(lm_head_model, device, compile_cfg);
+    std::cerr << "[DFlash GPU MEM] Draft compiled." << std::endl;
+
+    std::cerr << "[DFlash GPU MEM] Compiling draft_helper model (embed+lm_head combined)..." << std::endl;
+    auto compiled_draft_helper = core.compile_model(draft_helper_model, device, compile_cfg);
+    std::cerr << "[DFlash GPU MEM] All 3 models compiled." << std::endl;
 
     m_target_request = compiled_target.create_infer_request();
     m_draft_request = compiled_draft.create_infer_request();
-    m_embed_request = compiled_embed.create_infer_request();
-    m_lm_head_request = compiled_lm_head.create_infer_request();
+    // Two InferRequests from the same CompiledModel share GPU weight memory.
+    // embed_request reads "embeddings", lm_head_request reads "logits".
+    m_embed_request = compiled_draft_helper.create_infer_request();
+    m_lm_head_request = compiled_draft_helper.create_infer_request();
+
+    // Log state counts
+    {
+        auto target_states = m_target_request.query_state();
+        auto draft_states = m_draft_request.query_state();
+        std::cerr << "[DFlash GPU MEM] Target model states: " << target_states.size()
+                  << ", Draft model states: " << draft_states.size() << std::endl;
+    }
 
     for (const auto& input : compiled_target.inputs()) {
         const auto& names = input.get_names();
@@ -472,21 +486,41 @@ EncodedResults StatefulDFlashPipeline::generate(
 
     // Reset target state
     m_target_request.reset_state();
+    m_target_request.get_tensor("attention_mask").set_shape({1, 0});
     m_pending_snapshot_commit_index = -1;
 
     // ── Prefill ──
+    std::cerr << "[DFlash GPU MEM] Prefill: prompt_len=" << output_ids.size()
+              << " attention_mask_len=" << output_ids.size() << std::endl;
+
+    // Bind GPU RemoteTensors for snapshot outputs before prefill.
+    // With snapshot_max_seq = block_size, shape inference fixes snapshot S to block_size
+    // regardless of input length, so the same [1, block_size, ...] tensors work for both
+    // prefill and verify. Kernels skip snapshot writes when state_update_mode > 0 (prefill).
+    if (m_gpu_snapshots) {
+        for (auto& [snap_name, snap_remote] : m_snapshot_remote_tensors) {
+            m_target_request.set_tensor(snap_name, snap_remote);
+        }
+    }
+
     m_target_request.set_tensor("input_ids", make_ids_tensor(output_ids));
     m_target_request.set_tensor("attention_mask", make_attention_mask(output_ids.size()));
     m_target_request.set_tensor("position_ids", make_mrope_position_ids(0, output_ids.size()));
     m_target_request.set_tensor("beam_idx", beam_idx);
     set_target_state_update_mode(1);
+    std::cerr << "[DFlash GPU MEM] Prefill infer start..." << std::endl;
     m_target_request.infer();
+    std::cerr << "[DFlash GPU MEM] Prefill infer done." << std::endl;
 
     auto logits = m_target_request.get_tensor("logits");
     auto target_hidden_block = ensure_f32_copy(m_target_request.get_tensor("target_hidden"));
     m_hidden_dim = target_hidden_block.get_shape()[2];
 
     // Hidden state storage
+    const size_t hidden_storage_elems = (max_length + m_block_size) * m_hidden_dim;
+    std::cerr << "[DFlash GPU MEM] target_hidden_storage: [1," << (max_length + m_block_size)
+              << "," << m_hidden_dim << "] = "
+              << (hidden_storage_elems * 4 / 1024 / 1024) << " MB (f32 on CPU)" << std::endl;
     ov::Tensor target_hidden_storage(ov::element::f32, {1, max_length + m_block_size, m_hidden_dim});
     {
         ov::Tensor init_slice(target_hidden_storage, {0, 0, 0}, {1, prompt_len, m_hidden_dim});
@@ -498,12 +532,22 @@ EncodedResults StatefulDFlashPipeline::generate(
     output_ids.push_back(next_token);
     bool stopped = stream_token(next_token) || should_stop_on_token(next_token);
 
-    // Bind GPU RemoteTensors for snapshot outputs (after prefill, before decode loop)
-    // This must happen after prefill since prefill has different S than verify.
-    if (m_gpu_snapshots) {
-        for (auto& [snap_name, snap_remote] : m_snapshot_remote_tensors) {
-            m_target_request.set_tensor(snap_name, snap_remote);
-        }
+    // Pre-set dummy tensors for unused paths in the combined draft_helper model.
+    // The embed_request only reads "embeddings" output, and lm_head_request only
+    // reads "logits" output, but the combined model computes both per call.
+    // Minimal [1,1,...] inputs make the unused path's compute negligible.
+    // Note: m_hidden_dim is target_hidden dim (hidden_size * num_target_layers),
+    // NOT lm_head's expected input dim (hidden_size). Query from model port.
+    {
+        const auto& hs_port = m_embed_request.get_compiled_model().input("hidden_states");
+        size_t lm_hidden = static_cast<size_t>(hs_port.get_partial_shape()[2].get_length());
+        ov::Tensor dummy_hidden(ov::element::f32, {1, 1, lm_hidden});
+        std::memset(dummy_hidden.data(), 0, dummy_hidden.get_byte_size());
+        m_embed_request.set_tensor("hidden_states", dummy_hidden);
+
+        ov::Tensor dummy_ids(ov::element::i64, {1, 1});
+        dummy_ids.data<int64_t>()[0] = 0;
+        m_lm_head_request.set_tensor("input_ids", dummy_ids);
     }
 
     // ── Decode loop ──
@@ -537,7 +581,16 @@ EncodedResults StatefulDFlashPipeline::generate(
         m_draft_request.set_tensor("target_hidden", hidden_view);
         m_draft_request.set_tensor("noise_embedding", noise_embedding);
         m_draft_request.set_tensor("position_ids", draft_pos);
+        if (stat_draft_steps == 0) {
+            std::cerr << "[DFlash GPU MEM] Draft step #0: target_hidden=[1,"
+                      << target_hidden_len << "," << m_hidden_dim
+                      << "] noise_embedding=" << noise_embedding.get_shape()
+                      << " total_pos=" << total_pos << std::endl;
+        }
         m_draft_request.infer();
+        if (stat_draft_steps == 0) {
+            std::cerr << "[DFlash GPU MEM] Draft step #0 infer done." << std::endl;
+        }
 
         auto draft_hidden = m_draft_request.get_tensor("draft_hidden");
         // Convert dtype if needed
@@ -579,6 +632,11 @@ EncodedResults StatefulDFlashPipeline::generate(
 
         // Verify
         auto verify_start = Clock::now();
+        if (stat_draft_steps == 0) {
+            std::cerr << "[DFlash GPU MEM] Verify step #0: verify_len=" << verify_len
+                      << " attn_mask_len=" << (target_hidden_len + verify_len)
+                      << " kv_cache_seq=" << target_hidden_len << std::endl;
+        }
         m_target_request.set_tensor("input_ids", make_ids_tensor(block_output_ids));
         m_target_request.set_tensor("attention_mask", make_attention_mask(target_hidden_len + verify_len));
         m_target_request.set_tensor("position_ids", make_mrope_position_ids(target_hidden_len, verify_len));
@@ -596,6 +654,9 @@ EncodedResults StatefulDFlashPipeline::generate(
         auto t_set_tensor_end = Clock::now();
 
         m_target_request.infer();
+        if (stat_draft_steps == 0) {
+            std::cerr << "[DFlash GPU MEM] Verify step #0 infer done." << std::endl;
+        }
         auto t_infer_end = Clock::now();
 
         logits = m_target_request.get_tensor("logits");

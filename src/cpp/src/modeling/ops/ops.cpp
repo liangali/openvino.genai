@@ -181,13 +181,14 @@ std::tuple<Tensor, Tensor, Tensor> linear_attention_with_snapshots(
                                            const Tensor& beta,
                                            const Tensor& g,
                                            const Tensor& initial_state,
-                                           const std::shared_ptr<ov::op::util::Variable>& variable) {
+                                           const std::shared_ptr<ov::op::util::Variable>& variable,
+                                           int64_t snapshot_max_seq) {
     auto* ctx = q.context();
     if (!ctx) {
         ctx = resolve_context(k, v);
     }
     Tensor state_update_mode(const_vec(ctx, std::vector<int32_t>{1}), ctx);
-    return linear_attention_with_snapshots(q, k, v, beta, g, initial_state, variable, state_update_mode);
+    return linear_attention_with_snapshots(q, k, v, beta, g, initial_state, variable, state_update_mode, snapshot_max_seq);
 }
 
 std::tuple<Tensor, Tensor, Tensor> linear_attention_with_snapshots(
@@ -198,7 +199,8 @@ std::tuple<Tensor, Tensor, Tensor> linear_attention_with_snapshots(
                                            const Tensor& g,
                                            const Tensor& initial_state,
                                            const std::shared_ptr<ov::op::util::Variable>& variable,
-                                           const Tensor& state_update_mode) {
+                                           const Tensor& state_update_mode,
+                                           int64_t snapshot_max_seq) {
     auto* ctx = q.context();
     const Tensor* inputs[] = {&k, &v, &beta, &g, &initial_state, &state_update_mode};
     for (const auto* t : inputs) {
@@ -212,7 +214,7 @@ std::tuple<Tensor, Tensor, Tensor> linear_attention_with_snapshots(
     }
 
     ov::OutputVector args = {q.output(), k.output(), v.output(), g.output(), beta.output(), initial_state.output(), state_update_mode.output()};
-    auto node = std::make_shared<ov::op::LinearAttention>(args, variable, true);
+    auto node = std::make_shared<ov::op::LinearAttention>(args, variable, true, snapshot_max_seq);
     return {Tensor(node->output(0), ctx), Tensor(node->output(1), ctx), Tensor(node->output(2), ctx)};
 }
 
@@ -257,13 +259,14 @@ std::tuple<Tensor, Tensor, Tensor> fused_conv_with_snapshots(
                                      const Tensor& conv_weight,
                                      const Tensor& beam_idx,
                                      const Tensor& initial_state,
-                                     const std::shared_ptr<ov::op::util::Variable>& variable) {
+                                     const std::shared_ptr<ov::op::util::Variable>& variable,
+                                     int64_t snapshot_max_seq) {
     auto* ctx = input.context();
     if (!ctx) {
         ctx = resolve_context(conv_weight, beam_idx);
     }
     Tensor state_update_mode(const_vec(ctx, std::vector<int32_t>{1}), ctx);
-    return fused_conv_with_snapshots(input, conv_weight, beam_idx, initial_state, variable, state_update_mode);
+    return fused_conv_with_snapshots(input, conv_weight, beam_idx, initial_state, variable, state_update_mode, snapshot_max_seq);
 }
 
 std::tuple<Tensor, Tensor, Tensor> fused_conv_with_snapshots(
@@ -272,7 +275,8 @@ std::tuple<Tensor, Tensor, Tensor> fused_conv_with_snapshots(
                                      const Tensor& beam_idx,
                                      const Tensor& initial_state,
                                      const std::shared_ptr<ov::op::util::Variable>& variable,
-                                     const Tensor& state_update_mode) {
+                                     const Tensor& state_update_mode,
+                                     int64_t snapshot_max_seq) {
     auto* ctx = input.context();
     const Tensor* inputs[] = {&conv_weight, &beam_idx, &initial_state, &state_update_mode};
     for (const auto* t : inputs) {
@@ -286,7 +290,7 @@ std::tuple<Tensor, Tensor, Tensor> fused_conv_with_snapshots(
     }
 
     ov::OutputVector args = {input.output(), conv_weight.output(), beam_idx.output(), initial_state.output(), state_update_mode.output()};
-    auto node = std::make_shared<ov::op::FusedConv>(args, variable, true);
+    auto node = std::make_shared<ov::op::FusedConv>(args, variable, true, snapshot_max_seq);
     return {Tensor(node->output(0), ctx), Tensor(node->output(1), ctx), Tensor(node->output(2), ctx)};
 }
 
