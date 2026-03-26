@@ -870,9 +870,14 @@ Tensor Qwen3_5Model::forward_impl(const Tensor* input_ids,
         linear_mask = &(*linear_mask_view);
     }
 
+    // Sort capture IDs for efficient lookup during the layer loop
+    auto sorted_capture_ids = capture_layer_ids_;
+    std::sort(sorted_capture_ids.begin(), sorted_capture_ids.end());
+    size_t capture_idx = 0;
+
     std::optional<Tensor> residual;
-    for (auto& layer : layers_) {
-        auto out = layer.forward(hidden_states,
+    for (size_t i = 0; i < layers_.size(); ++i) {
+        auto out = layers_[i].forward(hidden_states,
                                  beam_idx,
                                  cos_sin.first,
                                  cos_sin.second,
@@ -884,6 +889,14 @@ Tensor Qwen3_5Model::forward_impl(const Tensor* input_ids,
                                  &shared_full_attn_sdpa_mask);
         hidden_states = out.first;
         residual = out.second;
+
+        // Capture intermediate hidden state at selected layer indices
+        if (capture_idx < sorted_capture_ids.size() &&
+            static_cast<int32_t>(i) == sorted_capture_ids[capture_idx]) {
+            Tensor pre_norm = residual ? (hidden_states + *residual) : hidden_states;
+            captured_hidden_.push_back(pre_norm);
+            ++capture_idx;
+        }
     }
 
     if (residual) {
@@ -999,71 +1012,27 @@ std::pair<Tensor, Tensor> Qwen3_5Model::forward_with_selected_layers(
     const Tensor* cache_position,
     const Tensor* state_update_mode,
     const std::vector<int32_t>& layer_ids) {
-    auto hidden_states = embed_tokens_.forward(input_ids);
-    auto cos_sin = build_mrope_cos_sin(position_ids);
-    auto* op_ctx = input_ids.context();
-    auto q_len_1d = Tensor(shape::dim(input_ids, 1), op_ctx);
-    auto shared_full_attn_sdpa_mask =
-        ops::llm::build_kv_causal_mask_with_attention_from_q_len(q_len_1d, full_attention_mask);
+    // Set up captures, then delegate to the shared forward_impl path
+    capture_layer_ids_ = layer_ids;
+    captured_hidden_.clear();
 
-    std::optional<Tensor> linear_mask_view;
-    const Tensor* linear_mask = nullptr;
-    if (linear_attention_mask) {
-        auto q_len = shape::dim(input_ids, 1);
-        auto mask_len = shape::dim(*linear_attention_mask, 1);
-        auto start = std::make_shared<ov::op::v1::Subtract>(mask_len, q_len);
-        auto sliced = std::make_shared<ov::op::v8::Slice>(
-            linear_attention_mask->output(),
-            start,
-            mask_len,
-            ops::const_vec(op_ctx, std::vector<int64_t>{1}),
-            ops::const_vec(op_ctx, std::vector<int64_t>{1}));
-        linear_mask_view = Tensor(sliced, op_ctx);
-        linear_mask = &(*linear_mask_view);
-    }
+    auto final_out = forward(input_ids, position_ids, beam_idx, full_attention_mask,
+                             linear_attention_mask, cache_position,
+                             nullptr, nullptr, state_update_mode);
 
-    std::vector<int32_t> sorted_ids = layer_ids;
-    std::sort(sorted_ids.begin(), sorted_ids.end());
-    size_t capture_idx = 0;
-    std::vector<Tensor> captures;
-    captures.reserve(sorted_ids.size());
+    capture_layer_ids_.clear();
 
-    std::optional<Tensor> residual;
-    for (size_t i = 0; i < layers_.size(); ++i) {
-        auto out = layers_[i].forward(hidden_states,
-                                      beam_idx,
-                                      cos_sin.first,
-                                      cos_sin.second,
-                                      &full_attention_mask,
-                                      linear_mask,
-                                      cache_position,
-                                      residual,
-                                      state_update_mode,
-                                      &shared_full_attn_sdpa_mask);
-        hidden_states = out.first;
-        residual = out.second;
-        if (capture_idx < sorted_ids.size() && static_cast<int32_t>(i) == sorted_ids[capture_idx]) {
-            Tensor pre_norm = residual ? (hidden_states + *residual) : hidden_states;
-            captures.push_back(pre_norm);
-            ++capture_idx;
-        }
-    }
-
-    Tensor final_out = residual ? norm_.forward(hidden_states, *residual).first
-                                : norm_.forward(hidden_states);
-    if (captures.empty()) {
+    if (captured_hidden_.empty()) {
         return {final_out, final_out};
     }
-    auto concat_hidden = ops::concat(captures, 2);
+    auto concat_hidden = ops::concat(captured_hidden_, 2);
+    captured_hidden_.clear();
     return {final_out, concat_hidden};
 }
 
-std::shared_ptr<ov::Model> create_qwen3_5_text_model(
-    const Qwen3_5Config& cfg,
-    ov::genai::modeling::weights::WeightSource& source,
-    ov::genai::modeling::weights::WeightFinalizer& finalizer,
-    bool use_inputs_embeds,
-    bool enable_visual_inputs) {
+namespace {
+
+Qwen3_5TextModelConfig make_text_model_config(const Qwen3_5Config& cfg) {
     Qwen3_5TextModelConfig text_cfg;
     text_cfg.architecture = "qwen3_5";
     text_cfg.hidden_size = cfg.text.hidden_size;
@@ -1096,6 +1065,18 @@ std::shared_ptr<ov::Model> create_qwen3_5_text_model(
     text_cfg.router_aux_loss_coef = cfg.text.router_aux_loss_coef;
     text_cfg.mrope_interleaved = cfg.text.rope.mrope_interleaved;
     text_cfg.mrope_section = cfg.text.rope.mrope_section;
+    return text_cfg;
+}
+
+}  // namespace
+
+std::shared_ptr<ov::Model> create_qwen3_5_text_model(
+    const Qwen3_5Config& cfg,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer,
+    bool use_inputs_embeds,
+    bool enable_visual_inputs) {
+    auto text_cfg = make_text_model_config(cfg);
 
     const auto effective_cfg = apply_qwen3_5_layer_limit(text_cfg);
 
@@ -1197,46 +1178,6 @@ std::shared_ptr<ov::Model> create_qwen3_5_text_model(
     ov_model->set_rt_info(8.0f, {"runtime_options", ov::hint::activations_scale_factor.name()});
     return ov_model;
 }
-
-namespace {
-
-Qwen3_5TextModelConfig make_text_model_config(const Qwen3_5Config& cfg) {
-    Qwen3_5TextModelConfig text_cfg;
-    text_cfg.architecture = "qwen3_5";
-    text_cfg.hidden_size = cfg.text.hidden_size;
-    text_cfg.num_attention_heads = cfg.text.num_attention_heads;
-    text_cfg.num_key_value_heads = cfg.text.num_key_value_heads > 0 ? cfg.text.num_key_value_heads : cfg.text.num_attention_heads;
-    text_cfg.head_dim = cfg.text.resolved_head_dim();
-    text_cfg.intermediate_size = cfg.text.intermediate_size;
-    text_cfg.num_hidden_layers = cfg.text.num_hidden_layers;
-    text_cfg.vocab_size = cfg.text.vocab_size;
-    text_cfg.max_position_embeddings = cfg.text.max_position_embeddings;
-    text_cfg.rms_norm_eps = cfg.text.rms_norm_eps;
-    text_cfg.rope_theta = cfg.text.rope_theta;
-    text_cfg.partial_rotary_factor = cfg.text.partial_rotary_factor;
-    text_cfg.hidden_act = cfg.text.hidden_act;
-    text_cfg.attention_bias = cfg.text.attention_bias;
-    text_cfg.tie_word_embeddings = cfg.text.tie_word_embeddings;
-    text_cfg.layer_types = cfg.text.layer_types;
-    text_cfg.full_attention_interval = cfg.text.full_attention_interval;
-    text_cfg.linear_conv_kernel_dim = cfg.text.linear_conv_kernel_dim;
-    text_cfg.linear_key_head_dim = cfg.text.linear_key_head_dim;
-    text_cfg.linear_value_head_dim = cfg.text.linear_value_head_dim;
-    text_cfg.linear_num_key_heads = cfg.text.linear_num_key_heads;
-    text_cfg.linear_num_value_heads = cfg.text.linear_num_value_heads;
-    text_cfg.moe_intermediate_size = cfg.text.moe_intermediate_size;
-    text_cfg.shared_expert_intermediate_size = cfg.text.shared_expert_intermediate_size;
-    text_cfg.num_experts = cfg.text.num_experts;
-    text_cfg.num_experts_per_tok = cfg.text.num_experts_per_tok;
-    text_cfg.norm_topk_prob = cfg.text.norm_topk_prob;
-    text_cfg.output_router_logits = cfg.text.output_router_logits;
-    text_cfg.router_aux_loss_coef = cfg.text.router_aux_loss_coef;
-    text_cfg.mrope_interleaved = cfg.text.rope.mrope_interleaved;
-    text_cfg.mrope_section = cfg.text.rope.mrope_section;
-    return text_cfg;
-}
-
-}  // namespace
 
 std::shared_ptr<ov::Model> create_qwen3_5_dflash_target_model(
     const Qwen3_5Config& cfg,

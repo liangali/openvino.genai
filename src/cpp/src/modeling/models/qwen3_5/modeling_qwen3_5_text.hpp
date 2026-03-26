@@ -289,6 +289,10 @@ private:
     int32_t head_dim_ = 0;
     int32_t rotary_dim_ = 0;
     float rope_theta_ = 10000.0f;
+
+    // Layer capture support — set by forward_with_selected_layers before calling forward_impl
+    std::vector<int32_t> capture_layer_ids_;
+    std::vector<Tensor> captured_hidden_;
 };
 
 class Qwen3_5ForCausalLM : public Module {
