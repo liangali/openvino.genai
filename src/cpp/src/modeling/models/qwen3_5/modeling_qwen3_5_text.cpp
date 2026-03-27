@@ -1011,14 +1011,16 @@ std::pair<Tensor, Tensor> Qwen3_5Model::forward_with_selected_layers(
     const Tensor* linear_attention_mask,
     const Tensor* cache_position,
     const Tensor* state_update_mode,
-    const std::vector<int32_t>& layer_ids) {
+    const std::vector<int32_t>& layer_ids,
+    const Tensor* visual_embeds,
+    const Tensor* visual_pos_mask) {
     // Set up captures, then delegate to the shared forward_impl path
     capture_layer_ids_ = layer_ids;
     captured_hidden_.clear();
 
     auto final_out = forward(input_ids, position_ids, beam_idx, full_attention_mask,
                              linear_attention_mask, cache_position,
-                             nullptr, nullptr, state_update_mode);
+                             visual_embeds, visual_pos_mask, state_update_mode);
 
     capture_layer_ids_.clear();
 
@@ -1184,7 +1186,8 @@ std::shared_ptr<ov::Model> create_qwen3_5_dflash_target_model(
     const std::vector<int32_t>& target_layer_ids,
     ov::genai::modeling::weights::WeightSource& source,
     ov::genai::modeling::weights::WeightFinalizer& finalizer,
-    int32_t snapshot_block_size) {
+    int32_t snapshot_block_size,
+    bool enable_visual_inputs) {
     auto text_cfg = make_text_model_config(cfg);
     const auto effective_cfg = apply_qwen3_5_layer_limit(text_cfg);
 
@@ -1214,13 +1217,27 @@ std::shared_ptr<ov::Model> create_qwen3_5_dflash_target_model(
     auto beam_idx = ctx.parameter(Qwen3_5TextIO::kBeamIdx, ov::element::i32, ov::PartialShape{-1});
     auto state_update_mode = ctx.parameter("state_update_mode", ov::element::i32, ov::PartialShape{1});
 
+    const Tensor* visual_embeds_ptr = nullptr;
+    const Tensor* visual_pos_mask_ptr = nullptr;
+    Tensor visual_embeds;
+    Tensor visual_pos_mask;
+    if (enable_visual_inputs) {
+        visual_embeds = ctx.parameter(Qwen3_5TextIO::kVisualEmbeds, ov::element::f32,
+                                       ov::PartialShape{-1, -1, cfg.text.hidden_size});
+        visual_pos_mask = ctx.parameter(Qwen3_5TextIO::kVisualPosMask, ov::element::boolean,
+                                         ov::PartialShape{-1, -1});
+        visual_embeds_ptr = &visual_embeds;
+        visual_pos_mask_ptr = &visual_pos_mask;
+    }
+
     // Enable snapshot accumulation during model construction
     g_snapshot_accumulator.entries.clear();
     g_snapshot_accumulator.active = use_state_snapshots() && use_fused_conv_op() && use_linear_attention_op();
     g_snapshot_accumulator.snapshot_max_seq = snapshot_block_size;
 
     auto outputs = model.model().forward_with_selected_layers(
-        input_ids, position_ids, beam_idx, attention_mask, &attention_mask, nullptr, &state_update_mode, target_layer_ids);
+        input_ids, position_ids, beam_idx, attention_mask, &attention_mask, nullptr, &state_update_mode, target_layer_ids,
+        visual_embeds_ptr, visual_pos_mask_ptr);
 
     g_snapshot_accumulator.active = false;
 

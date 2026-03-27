@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <map>
 #include <optional>
 #include <random>
 #include <sstream>
@@ -25,10 +26,13 @@
 #include "safetensors_utils/safetensors_loader.hpp"
 #include "safetensors_utils/safetensors_weight_finalizer.hpp"
 #include "safetensors_utils/safetensors_weight_source.hpp"
+#include "modeling/weights/quantization_config.hpp"
 #include "utils.hpp"
 
+#include "load_image.hpp"
 #include "modeling/models/dflash_draft/dflash_draft.hpp"
 #include "modeling/models/qwen3_5/modeling_qwen3_5_text.hpp"
+#include "modeling/models/qwen3_5/modeling_qwen3_5_vision.hpp"
 #include "modeling/models/qwen3_5/processing_qwen3_5.hpp"
 
 namespace {
@@ -53,16 +57,12 @@ struct StageStats {
 
 struct PerfStats {
     StageStats prefill_wall;
-    StageStats target_ctx_wall;
     StageStats embed_wall;
     StageStats draft_wall;
     StageStats lm_head_wall;
     StageStats verify_wall;
     StageStats other_wall;
-    StageStats prep_wall;
     StageStats postproc_wall;
-    StageStats kv_trim_wall;
-    StageStats hidden_append_wall;
     StageStats set_tensor_wall;
     StageStats get_tensor_wall;
     StageStats argmax_wall;
@@ -74,14 +74,6 @@ struct PerfStats {
     double ttft_ms = 0.0;
     double total_generate_ms = 0.0;
     std::vector<size_t> accepted_per_step;
-};
-
-struct TargetBaselineStats {
-    StageStats prefill_wall;
-    StageStats decode_wall;
-    size_t generated_tokens = 0;
-    double ttft_ms = 0.0;
-    double total_generate_ms = 0.0;
 };
 
 double duration_ms(Clock::time_point start, Clock::time_point end) {
@@ -260,6 +252,37 @@ ov::Tensor make_beam_idx(size_t batch) {
     return beam_idx;
 }
 
+ov::Tensor make_state_update_mode_tensor(int32_t mode) {
+    ov::Tensor t(ov::element::i32, {1});
+    t.data<int32_t>()[0] = mode;
+    return t;
+}
+
+bool deferred_state_commit_enabled_by_default() {
+    const char* raw = std::getenv("OV_GENAI_DISABLE_DFLASH_DEFERRED_STATE_COMMIT");
+    return !(raw && std::string(raw) == "1");
+}
+
+std::string build_vl_prompt(const std::string& user_prompt, int64_t image_tokens) {
+    std::string prompt = "<|im_start|>user\n<|vision_start|>";
+    for (int64_t i = 0; i < image_tokens; ++i)
+        prompt += "<|image_pad|>";
+    prompt += "<|vision_end|>\n";
+    prompt += user_prompt;
+    prompt += "<|im_end|>\n<|im_start|>assistant\n";
+    return prompt;
+}
+
+std::string resolve_pos_embed_name(ov::genai::safetensors::SafetensorsWeightSource& source) {
+    for (const auto& name : {"model.visual.pos_embed.weight", "visual.pos_embed.weight", "pos_embed.weight"}) {
+        if (source.has(name)) return name;
+    }
+    for (const auto& name : source.keys()) {
+        if (name.find("pos_embed.weight") != std::string::npos) return name;
+    }
+    throw std::runtime_error("Failed to find pos_embed.weight in safetensors");
+}
+
 // Save linear attention (GatedDeltaNet) states — these cannot be "trimmed"
 // like KV cache entries, so we must save/restore them around verification.
 std::vector<std::pair<std::string, ov::Tensor>> save_linear_states(ov::InferRequest& req) {
@@ -289,71 +312,23 @@ void restore_linear_states(ov::InferRequest& req,
     }
 }
 
-struct TargetBaselineResult {
-    TargetBaselineStats stats;
-    std::vector<int64_t> output_ids;
-};
-
-TargetBaselineResult run_target_baseline(ov::InferRequest& target_request,
-                                         const ov::Tensor& beam_idx,
-                                         const std::vector<int64_t>& prompt_ids,
-                                         int max_new_tokens,
-                                         int64_t eos_token_id) {
-    TargetBaselineResult result;
-    result.output_ids = prompt_ids;
-    const size_t prompt_len = prompt_ids.size();
-    const size_t max_length = prompt_len + static_cast<size_t>(max_new_tokens);
-
-    auto prefill_start = Clock::now();
-    target_request.set_tensor("input_ids", make_ids_tensor(result.output_ids));
-    target_request.set_tensor("attention_mask", make_attention_mask(result.output_ids.size()));
-    target_request.set_tensor("position_ids", make_mrope_position_ids(0, result.output_ids.size()));
-    target_request.set_tensor("beam_idx", beam_idx);
-    target_request.infer();
-    auto logits = target_request.get_tensor("logits");
-    auto prefill_end = Clock::now();
-    result.stats.prefill_wall.add(duration_ms(prefill_start, prefill_end));
-
-    int64_t next_token = argmax_last_token(logits);
-    result.stats.ttft_ms = duration_ms(prefill_start, prefill_end);
-    result.output_ids.push_back(next_token);
-    const auto generation_start = Clock::now();
-    while (result.output_ids.size() < max_length) {
-        if (next_token == eos_token_id) break;
-        auto decode_start = Clock::now();
-        const size_t pos = result.output_ids.size() - 1;
-        target_request.set_tensor("input_ids", make_ids_tensor({next_token}));
-        target_request.set_tensor("attention_mask", make_attention_mask(1));
-        target_request.set_tensor("position_ids", make_mrope_position_ids(pos, 1));
-        target_request.set_tensor("beam_idx", beam_idx);
-        target_request.infer();
-        auto decode_end = Clock::now();
-        result.stats.decode_wall.add(duration_ms(decode_start, decode_end));
-
-        logits = target_request.get_tensor("logits");
-        next_token = argmax_last_token(logits);
-        result.output_ids.push_back(next_token);
-    }
-
-    const auto generation_end = Clock::now();
-    result.stats.total_generate_ms = duration_ms(generation_start, generation_end);
-    result.stats.generated_tokens = result.output_ids.size() - prompt_len;
-    return result;
-}
-
 }  // namespace
 
 int main(int argc, char* argv[]) try {
     if (argc < 3) {
         std::cerr << "Usage: " << argv[0]
-                  << " <TARGET_MODEL_DIR> <DRAFT_MODEL_DIR> [PROMPT] [DEVICE] [MAX_NEW_TOKENS] [BLOCK_SIZE]\n"
+                  << " <TARGET_MODEL_DIR> <DRAFT_MODEL_DIR> [PROMPT] [DEVICE] [MAX_NEW_TOKENS] [BLOCK_SIZE]"
+                  << " [TARGET_QUANT] [DRAFT_QUANT] [IMAGE_PATH]\n"
                   << "\n"
                   << "  TARGET_MODEL_DIR  Path to Qwen3.5-4B HF model directory\n"
                   << "  DRAFT_MODEL_DIR   Path to DFlash draft model directory\n"
                   << "  PROMPT            Input prompt (default: 'Tell me a short story about a robot.')\n"
                   << "  DEVICE            OpenVINO device (default: CPU)\n"
                   << "  MAX_NEW_TOKENS    Max tokens to generate (default: 64)\n"
-                  << "  BLOCK_SIZE        DFlash block size override (default: from config)\n";
+                  << "  BLOCK_SIZE        DFlash block size override (default: from config)\n"
+                  << "  TARGET_QUANT      Target model quantization: FP16, INT4_ASYM, INT4_SYM (default: FP16 or env)\n"
+                  << "  DRAFT_QUANT       Draft model quantization: FP16, INT4_ASYM, INT4_SYM (default: FP16)\n"
+                  << "  IMAGE_PATH        Path to image file for VL mode (optional, text-only if omitted)\n";
         return 1;
     }
 
@@ -363,13 +338,18 @@ int main(int argc, char* argv[]) try {
     const std::string device = (argc > 4) ? argv[4] : "CPU";
     const int max_new_tokens = (argc > 5) ? std::stoi(argv[5]) : 500;
     const int block_size_arg = (argc > 6) ? std::stoi(argv[6]) : 0;
+    const std::string target_quant_arg = (argc > 7) ? argv[7] : "";
+    const std::string draft_quant_arg = (argc > 8) ? argv[8] : "";
+    const std::string image_path_arg = (argc > 9) ? argv[9] : "";
 
-    std::cout << "[Qwen3.5 DFlash Sample]" << std::endl;
+    const bool vl_mode = !image_path_arg.empty();
+
+    std::cout << "[Qwen3.5 DFlash Sample" << (vl_mode ? " VL" : "") << "]" << std::endl;
     std::cout << "  Target model: " << target_dir << std::endl;
     std::cout << "  Draft model:  " << draft_dir << std::endl;
+    if (vl_mode) std::cout << "  Image:        " << image_path_arg << std::endl;
     std::cout << "  Device:       " << device << std::endl;
     std::cout << "  Max tokens:   " << max_new_tokens << std::endl;
-    std::cout << "  Prompt:       " << prompt << std::endl;
 
     // Load target model config (Qwen3.5)
     auto target_qwen35_cfg = ov::genai::modeling::models::Qwen3_5Config::from_json_file(target_dir);
@@ -415,35 +395,98 @@ int main(int argc, char* argv[]) try {
     }
     std::cout << std::endl;
 
+    // Parse quantization config: CLI arg takes priority, then env vars
+    auto parse_quant_mode = [](const std::string& s) -> ov::genai::modeling::weights::QuantizationConfig::Mode {
+        if (s == "INT4_ASYM") return ov::genai::modeling::weights::QuantizationConfig::Mode::INT4_ASYM;
+        if (s == "INT4_SYM")  return ov::genai::modeling::weights::QuantizationConfig::Mode::INT4_SYM;
+        if (s == "INT8_ASYM") return ov::genai::modeling::weights::QuantizationConfig::Mode::INT8_ASYM;
+        if (s == "INT8_SYM")  return ov::genai::modeling::weights::QuantizationConfig::Mode::INT8_SYM;
+        return ov::genai::modeling::weights::QuantizationConfig::Mode::NONE;
+    };
+    auto quant_mode_name = [](ov::genai::modeling::weights::QuantizationConfig::Mode m) -> const char* {
+        switch (m) {
+            case ov::genai::modeling::weights::QuantizationConfig::Mode::INT4_ASYM: return "INT4_ASYM";
+            case ov::genai::modeling::weights::QuantizationConfig::Mode::INT4_SYM:  return "INT4_SYM";
+            case ov::genai::modeling::weights::QuantizationConfig::Mode::INT8_ASYM: return "INT8_ASYM";
+            case ov::genai::modeling::weights::QuantizationConfig::Mode::INT8_SYM:  return "INT8_SYM";
+            default: return "NONE";
+        }
+    };
+
+    // Target quantization: CLI arg > env var > FP16
+    ov::genai::modeling::weights::QuantizationConfig target_quant_config;
+    if (!target_quant_arg.empty() && target_quant_arg != "FP16") {
+        target_quant_config.mode = parse_quant_mode(target_quant_arg);
+        target_quant_config.group_size = 128;
+        target_quant_config.backup_mode = ov::genai::modeling::weights::QuantizationConfig::Mode::INT8_ASYM;
+    } else if (target_quant_arg.empty()) {
+        target_quant_config = ov::genai::modeling::weights::parse_quantization_config_from_env();
+    }
+    std::cout << "[quant] target: " << (target_quant_config.enabled() ? quant_mode_name(target_quant_config.mode) : "FP16");
+    if (target_quant_config.enabled()) std::cout << ", group_size=" << target_quant_config.group_size;
+    std::cout << std::endl;
+
+    // Draft quantization: CLI arg > FP16 (no env var fallback for draft)
+    ov::genai::modeling::weights::QuantizationConfig draft_quant_config;
+    if (!draft_quant_arg.empty() && draft_quant_arg != "FP16") {
+        draft_quant_config.mode = parse_quant_mode(draft_quant_arg);
+        draft_quant_config.group_size = 128;
+        draft_quant_config.backup_mode = ov::genai::modeling::weights::QuantizationConfig::Mode::INT8_ASYM;
+    }
+    std::cout << "[quant] draft:  " << (draft_quant_config.enabled() ? quant_mode_name(draft_quant_config.mode) : "FP16");
+    if (draft_quant_config.enabled()) std::cout << ", group_size=" << draft_quant_config.group_size;
+    std::cout << std::endl;
+
     // Load weights
-    auto target_data = ov::genai::safetensors::load_safetensors(target_dir);
-    ov::genai::safetensors::SafetensorsWeightSource target_source(std::move(target_data));
-    ov::genai::safetensors::SafetensorsWeightFinalizer target_finalizer;
-
-    auto draft_data = ov::genai::safetensors::load_safetensors(draft_dir);
-    ov::genai::safetensors::SafetensorsWeightSource draft_source(std::move(draft_data));
-    ov::genai::safetensors::SafetensorsWeightFinalizer draft_finalizer;
-
     PerfStats perf;
     double dflash_throughput = 0.0;
 
-    // Build models
-    std::cout << "[Building target model (Qwen3.5 DFlash target)...]" << std::endl;
-    auto target_model = ov::genai::modeling::models::create_qwen3_5_dflash_target_model(
-        target_qwen35_cfg, target_layer_ids, target_source, target_finalizer);
+    // Build models inside a scope so that weight sources are freed after model building.
+    // On iGPU (shared CPU/GPU memory), this recovers ~10+ GB of safetensors data.
+    std::shared_ptr<ov::Model> target_model;
+    std::shared_ptr<ov::Model> draft_model;
+    std::shared_ptr<ov::Model> draft_helper_model;
+    std::shared_ptr<ov::Model> vision_model;
+    ov::Tensor vl_pos_embed_weight;  // Extracted in scope for VL preprocessing later
+    {
+        // Load weights — scoped so safetensors data (~10+ GB) is freed after model building.
+        // On iGPU (shared CPU/GPU memory), this avoids memory bandwidth contention during decode.
+        auto target_data = ov::genai::safetensors::load_safetensors(target_dir);
+        ov::genai::safetensors::SafetensorsWeightSource target_source(std::move(target_data));
+        ov::genai::safetensors::SafetensorsWeightFinalizer target_finalizer(
+            target_quant_config.enabled() ? target_quant_config
+                                          : ov::genai::modeling::weights::QuantizationConfig{});
 
-    std::cout << "[Building draft model...]" << std::endl;
-    const auto draft_compute_type = ov::element::f32;
-    auto draft_model = ov::genai::modeling::models::create_dflash_draft_model(
-        dflash_cfg, draft_source, draft_finalizer, draft_compute_type);
+        auto draft_data = ov::genai::safetensors::load_safetensors(draft_dir);
+        ov::genai::safetensors::SafetensorsWeightSource draft_source(std::move(draft_data));
+        ov::genai::safetensors::SafetensorsWeightFinalizer draft_finalizer(
+            draft_quant_config.enabled() ? draft_quant_config
+                                         : ov::genai::modeling::weights::QuantizationConfig{});
 
-    std::cout << "[Building embedding model...]" << std::endl;
-    auto embed_model = ov::genai::modeling::models::create_qwen3_5_embedding_model(
-        target_qwen35_cfg, target_source, target_finalizer);
+        std::cout << "[Building target model (Qwen3.5 DFlash target" << (vl_mode ? " VL" : "") << ")...]" << std::endl;
+        target_model = ov::genai::modeling::models::create_qwen3_5_dflash_target_model(
+            target_qwen35_cfg, target_layer_ids, target_source, target_finalizer, dflash_cfg.block_size, vl_mode);
 
-    std::cout << "[Building lm_head model...]" << std::endl;
-    auto lm_head_model = ov::genai::modeling::models::create_qwen3_5_lm_head_model(
-        target_qwen35_cfg, target_source, target_finalizer, ov::element::f32);
+        if (vl_mode) {
+            std::cout << "[Building vision model...]" << std::endl;
+            ov::genai::safetensors::SafetensorsWeightFinalizer vision_finalizer;
+            vision_model = ov::genai::modeling::models::create_qwen3_5_vision_model(
+                target_qwen35_cfg, target_source, vision_finalizer);
+
+            // Extract pos_embed weight now — needed for VL preprocessing after scope exits
+            const std::string pos_embed_name = resolve_pos_embed_name(target_source);
+            vl_pos_embed_weight = target_source.get_tensor(pos_embed_name);
+        }
+
+        std::cout << "[Building draft model...]" << std::endl;
+        const auto draft_compute_type = ov::element::f32;
+        draft_model = ov::genai::modeling::models::create_dflash_draft_model(
+            dflash_cfg, draft_source, draft_finalizer, draft_compute_type);
+
+        std::cout << "[Building draft_helper model (embed+lm_head combined)...]" << std::endl;
+        draft_helper_model = ov::genai::modeling::models::create_qwen3_5_draft_helper_model(
+            target_qwen35_cfg, target_source, target_finalizer, ov::element::f32);
+    } // Weight sources (target_source, draft_source) and their safetensors data freed here.
 
     // Compile models
     ov::Core core;
@@ -473,21 +516,90 @@ int main(int argc, char* argv[]) try {
     const int64_t eos_token_id = tokenizer.get_eos_token_id();
     std::cout << "[DEBUG] mask_token_id=" << mask_token_id << " eos_token_id=" << eos_token_id << std::endl;
 
-    // Apply chat template if available
-    std::string formatted_prompt = prompt;
-    bool add_special_tokens = true;
-    try {
-        if (!tokenizer.get_chat_template().empty()) {
-            ov::genai::ChatHistory history({{{"role", "user"}, {"content", prompt}}});
-            formatted_prompt = tokenizer.apply_chat_template(history, true);
-            add_special_tokens = false;
+    // ---- VL preprocessing (vision encode + prompt building) ----
+    ov::Tensor visual_embeds_padded;   // VL: [1, prompt_len, hidden_size]
+    ov::Tensor visual_pos_mask_tensor; // VL: [1, prompt_len] boolean
+    ov::Tensor vl_position_ids;        // VL: [3, 1, prompt_len] mRoPE
+    ov::Tensor vl_input_ids;           // VL: [1, prompt_len] token ids
+    ov::CompiledModel compiled_vision;
+    if (vl_mode) {
+        std::cout << "[VL] Loading and preprocessing image: " << image_path_arg << std::endl;
+
+        // Load preprocessor config
+        ov::genai::modeling::models::Qwen3_5VisionPreprocessConfig pre_cfg;
+        const auto pre_cfg_path = target_dir / "preprocessor_config.json";
+        if (std::filesystem::exists(pre_cfg_path)) {
+            pre_cfg = ov::genai::modeling::models::Qwen3_5VisionPreprocessConfig::from_json_file(pre_cfg_path);
         }
-    } catch (const std::exception& e) {
-        std::cerr << "Warning: chat template apply failed: " << e.what() << ", using raw prompt" << std::endl;
+
+        // Compile and run vision encoder
+        std::cout << "[VL] Compiling vision model..." << std::endl;
+        compiled_vision = core.compile_model(vision_model, device, compile_cfg);
+        auto vision_request = compiled_vision.create_infer_request();
+
+        auto image = utils::load_image(image_path_arg);
+
+        ov::genai::modeling::models::Qwen3_5VisionPreprocessor preprocessor(
+            target_qwen35_cfg.vision, pre_cfg);
+        auto vision_inputs = preprocessor.preprocess(image, vl_pos_embed_weight);
+
+        vision_request.set_tensor(ov::genai::modeling::models::Qwen3_5VisionIO::kPixelValues, vision_inputs.pixel_values);
+        vision_request.set_tensor(ov::genai::modeling::models::Qwen3_5VisionIO::kGridThw, vision_inputs.grid_thw);
+        vision_request.set_tensor(ov::genai::modeling::models::Qwen3_5VisionIO::kPosEmbeds, vision_inputs.pos_embeds);
+        vision_request.set_tensor(ov::genai::modeling::models::Qwen3_5VisionIO::kRotaryCos, vision_inputs.rotary_cos);
+        vision_request.set_tensor(ov::genai::modeling::models::Qwen3_5VisionIO::kRotarySin, vision_inputs.rotary_sin);
+
+        std::cout << "[VL] Running vision encoder..." << std::endl;
+        vision_request.infer();
+        auto visual_embeds_raw = vision_request.get_tensor(
+            ov::genai::modeling::models::Qwen3_5VisionIO::kVisualEmbeds);
+
+        // Count visual tokens and build VL prompt
+        const int64_t image_tokens =
+            ov::genai::modeling::models::Qwen3_5VisionPreprocessor::count_visual_tokens(
+                vision_inputs.grid_thw, target_qwen35_cfg.vision.spatial_merge_size);
+        std::cout << "[VL] Image tokens: " << image_tokens << std::endl;
+
+        std::string vl_prompt = build_vl_prompt(prompt, image_tokens);
+        auto vl_encoded = tokenizer.encode(vl_prompt, {ov::genai::add_special_tokens(false)});
+
+        // Build input plan for mRoPE position IDs and visual position mask
+        ov::genai::modeling::models::Qwen3_5InputPlanner planner(target_qwen35_cfg);
+        auto plan = planner.build_plan(vl_encoded.input_ids, &vl_encoded.attention_mask,
+                                       &vision_inputs.grid_thw);
+
+        // Scatter visual embeddings into padded sequence-length tensor
+        visual_embeds_padded = ov::genai::modeling::models::Qwen3_5InputPlanner::scatter_visual_embeds(
+            visual_embeds_raw, plan.visual_pos_mask);
+        visual_pos_mask_tensor = plan.visual_pos_mask;
+        vl_position_ids = plan.position_ids;
+        vl_input_ids = vl_encoded.input_ids;
+
+        std::cout << "[VL] Vision preprocessing complete." << std::endl;
     }
 
-    auto encoded = tokenizer.encode(formatted_prompt, {ov::genai::add_special_tokens(add_special_tokens)});
-    const std::vector<int64_t> prompt_ids = tensor_to_ids(encoded.input_ids);
+    // Tokenize prompt
+    ov::Tensor prompt_input_ids;
+    if (vl_mode) {
+        prompt_input_ids = vl_input_ids;
+    } else {
+        // Apply chat template if available (text-only mode)
+        std::string formatted_prompt = prompt;
+        bool add_special_tokens = true;
+        try {
+            if (!tokenizer.get_chat_template().empty()) {
+                ov::genai::ChatHistory history({{{"role", "user"}, {"content", prompt}}});
+                formatted_prompt = tokenizer.apply_chat_template(history, true);
+                add_special_tokens = false;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: chat template apply failed: " << e.what() << ", using raw prompt" << std::endl;
+        }
+        auto encoded = tokenizer.encode(formatted_prompt, {ov::genai::add_special_tokens(add_special_tokens)});
+        prompt_input_ids = encoded.input_ids;
+    }
+
+    const std::vector<int64_t> prompt_ids = tensor_to_ids(prompt_input_ids);
     std::vector<int64_t> output_ids = prompt_ids;
     const size_t prompt_len = output_ids.size();
     const size_t max_length = prompt_len + static_cast<size_t>(max_new_tokens);
@@ -496,15 +608,26 @@ int main(int argc, char* argv[]) try {
 
     // Compile
     std::cout << "[Compiling models on " << device << "...]" << std::endl;
+    std::cout << "[Compiling target model...]" << std::endl;
     auto compiled_target = core.compile_model(target_model, device, compile_cfg);
-    auto compiled_embed = core.compile_model(embed_model, device, compile_cfg);
-    auto compiled_lm_head = core.compile_model(lm_head_model, device, compile_cfg);
+    std::cout << "[Compiling draft model...]" << std::endl;
     auto compiled_draft = core.compile_model(draft_model, device, compile_cfg);
+    std::cout << "[Compiling draft_helper model (embed+lm_head combined)...]" << std::endl;
+    auto compiled_draft_helper = core.compile_model(draft_helper_model, device, compile_cfg);
+    std::cout << "[All 3 models compiled.]" << std::endl;
 
     auto target_request = compiled_target.create_infer_request();
-    auto embed_request = compiled_embed.create_infer_request();
-    auto lm_head_request = compiled_lm_head.create_infer_request();
     auto draft_request = compiled_draft.create_infer_request();
+    auto embed_request = compiled_draft_helper.create_infer_request();
+    auto lm_head_request = compiled_draft_helper.create_infer_request();
+
+    // Release model graphs and weight data — no longer needed after compilation.
+    // On iGPU (shared CPU/GPU memory), this recovers ~10+ GB that would otherwise
+    // compete with GPU for memory bandwidth during decode.
+    target_model.reset();
+    draft_model.reset();
+    draft_helper_model.reset();
+    if (vision_model) vision_model.reset();
 
     target_request.reset_state();
     ov::genai::utils::KVCacheState target_kv_state;
@@ -512,21 +635,132 @@ int main(int argc, char* argv[]) try {
     target_kv_state.seq_length_axis = kv_pos.seq_len;
     const auto beam_idx = make_beam_idx(1);
 
+    // Detect state_update_mode input
+    bool has_state_update_mode_input = false;
+    for (const auto& input : compiled_target.inputs()) {
+        const auto& names = input.get_names();
+        if (names.find("state_update_mode") != names.end()) {
+            has_state_update_mode_input = true;
+            break;
+        }
+    }
+
+    auto set_target_state_update_mode = [&](int32_t mode) {
+        if (!has_state_update_mode_input) return;
+        target_request.set_tensor("state_update_mode", make_state_update_mode_tensor(mode));
+    };
+
+    // Detect snapshot outputs (enables replay-free verify)
+    bool has_snapshots = false;
+    for (auto& output : compiled_target.outputs()) {
+        for (auto& name : output.get_names()) {
+            if (name.find("snapshot.") == 0) {
+                has_snapshots = true;
+                break;
+            }
+        }
+        if (has_snapshots) break;
+    }
+
+    // Setup GPU-side snapshot tensors if running on GPU
+    bool gpu_snapshots = false;
+    std::map<std::string, ov::Tensor> snapshot_remote_tensors;
+    ov::RemoteContext remote_context;
+    if (has_snapshots) {
+        try {
+            remote_context = compiled_target.get_context();
+            for (auto& output : compiled_target.outputs()) {
+                std::string snap_name;
+                for (auto& name : output.get_names()) {
+                    if (name.find("snapshot.") == 0) { snap_name = name; break; }
+                }
+                if (snap_name.empty()) continue;
+
+                auto pshape = output.get_partial_shape();
+                ov::Shape snap_shape;
+                snap_shape.push_back(1);
+                snap_shape.push_back(static_cast<size_t>(dflash_cfg.block_size));
+                for (size_t d = 2; d < pshape.size(); ++d)
+                    snap_shape.push_back(pshape[d].get_length());
+
+                auto dtype = output.get_element_type();
+                auto snap_remote = remote_context.create_tensor(dtype, snap_shape);
+                snapshot_remote_tensors[snap_name] = snap_remote;
+            }
+            gpu_snapshots = !snapshot_remote_tensors.empty();
+            if (gpu_snapshots) {
+                std::cout << "[Snapshots] GPU-side snapshot tensors allocated: "
+                          << snapshot_remote_tensors.size() << " outputs" << std::endl;
+            }
+        } catch (const std::exception& e) {
+            std::cout << "[Snapshots] GPU context not available, falling back to host: "
+                      << e.what() << std::endl;
+            gpu_snapshots = false;
+        }
+    }
+
+    const bool use_deferred_state_commit = has_snapshots &&
+                                           has_state_update_mode_input &&
+                                           deferred_state_commit_enabled_by_default();
+    if (use_deferred_state_commit) {
+        std::cout << "[DFlash] Deferred state commit enabled for snapshot verify" << std::endl;
+    } else if (has_snapshots && !has_state_update_mode_input) {
+        std::cout << "[DFlash] Deferred state commit unavailable: target model has no state_update_mode input" << std::endl;
+    }
+
+    int32_t pending_snapshot_commit_index = -1;
+
+    std::cout << "[DFlash] has_state_update_mode_input=" << has_state_update_mode_input
+              << " has_snapshots=" << has_snapshots
+              << " gpu_snapshots=" << gpu_snapshots
+              << " use_deferred_state_commit=" << use_deferred_state_commit << std::endl;
+
     std::cout << "---------------START INFERENCE --------------------" << std::endl;
+
+    // Bind GPU RemoteTensors for snapshot outputs before prefill.
+    if (gpu_snapshots) {
+        for (auto& [snap_name, snap_remote] : snapshot_remote_tensors) {
+            target_request.set_tensor(snap_name, snap_remote);
+        }
+    }
+
+    target_request.get_tensor("attention_mask").set_shape({1, 0});
 
     // Prefill: run target on prompt to get first token.
     auto prefill_start = Clock::now();
     target_request.set_tensor("input_ids", make_ids_tensor(output_ids));
     target_request.set_tensor("attention_mask", make_attention_mask(output_ids.size()));
-    target_request.set_tensor("position_ids", make_mrope_position_ids(0, output_ids.size()));
+    if (vl_mode) {
+        target_request.set_tensor("position_ids", vl_position_ids);
+        target_request.set_tensor("visual_embeds", visual_embeds_padded);
+        target_request.set_tensor("visual_pos_mask", visual_pos_mask_tensor);
+    } else {
+        target_request.set_tensor("position_ids", make_mrope_position_ids(0, output_ids.size()));
+    }
     target_request.set_tensor("beam_idx", beam_idx);
+    set_target_state_update_mode(1);
     target_request.infer();
     auto logits = target_request.get_tensor("logits");
+
+    // For VL mode, prepare zero visual tensors for subsequent decode/verify steps
+    ov::Tensor zero_visual_embeds;
+    ov::Tensor zero_visual_pos_mask;
+    if (vl_mode) {
+        const size_t hidden_size = static_cast<size_t>(target_qwen35_cfg.text.hidden_size);
+        zero_visual_embeds = ov::Tensor(ov::element::f32, {1, 1, hidden_size});
+        std::memset(zero_visual_embeds.data(), 0, zero_visual_embeds.get_byte_size());
+        zero_visual_pos_mask = ov::Tensor(ov::element::boolean, {1, 1});
+        zero_visual_pos_mask.data<bool>()[0] = false;
+    }
 
     target_kv_state.add_inputs(make_ids_tensor(output_ids));
     ov::Tensor target_hidden_block = ensure_f32_copy(target_request.get_tensor("target_hidden"));
     const size_t hidden_dim = target_hidden_block.get_shape()[2];
-    ov::Tensor target_hidden_storage(ov::element::f32, {1, max_length, hidden_dim});
+    const size_t hidden_storage_elems = (max_length + static_cast<size_t>(dflash_cfg.block_size)) * hidden_dim;
+    std::cerr << "[DFlash] target_hidden_storage: [1," << (max_length + dflash_cfg.block_size)
+              << "," << hidden_dim << "] = "
+              << (hidden_storage_elems * 4 / 1024 / 1024) << " MB (f32 on CPU)" << std::endl;
+    ov::Tensor target_hidden_storage(ov::element::f32, {1, max_length + static_cast<size_t>(dflash_cfg.block_size), hidden_dim});
     ov::Tensor target_hidden_init(target_hidden_storage, {0, 0, 0}, {1, prompt_len, hidden_dim});
     target_hidden_block.copy_to(target_hidden_init);
     size_t target_hidden_len = prompt_len;
@@ -543,12 +777,20 @@ int main(int argc, char* argv[]) try {
     const double prefill_ms = duration_ms(prefill_start, prefill_end);
     perf.prefill_wall.add(prefill_ms);
 
-    // Print prompt and first token for streaming output
-    std::cout << "\n[Streaming Output]\n";
-    auto prompt_text = tokenizer.decode(prompt_ids, {ov::genai::skip_special_tokens(true)});
-    std::cout << prompt_text;
-    auto first_token_text = tokenizer.decode({next_token}, {ov::genai::skip_special_tokens(true)});
-    std::cout << first_token_text << std::flush;
+    // Pre-set dummy tensors for unused paths in the combined draft_helper model.
+    {
+        const auto& hs_port = embed_request.get_compiled_model().input("hidden_states");
+        size_t lm_hidden = static_cast<size_t>(hs_port.get_partial_shape()[2].get_length());
+        ov::Tensor dummy_hidden(ov::element::f32, {1, 1, lm_hidden});
+        std::memset(dummy_hidden.data(), 0, dummy_hidden.get_byte_size());
+        embed_request.set_tensor("hidden_states", dummy_hidden);
+
+        ov::Tensor dummy_ids(ov::element::i64, {1, 1});
+        dummy_ids.data<int64_t>()[0] = 0;
+        lm_head_request.set_tensor("input_ids", dummy_ids);
+    }
+
+    std::cout << "\n[Generating...]" << std::flush;
 
     const auto generation_start = Clock::now();
 
@@ -589,14 +831,7 @@ int main(int argc, char* argv[]) try {
         auto get_embed_end = Clock::now();
         perf.get_tensor_wall.add(duration_ms(get_embed_start, get_embed_end));
 
-        // Build position_ids for draft model (mRoPE 3D is NOT used by draft;
-        // the draft model uses 2D position_ids like original DFlash)
-        auto make_pos_start = Clock::now();
-        const auto position_ids = make_mrope_position_ids_with_overlap(target_hidden_len, block_ids.size());
-        auto make_pos_end = Clock::now();
-        perf.make_tensor_wall.add(duration_ms(make_pos_start, make_pos_end));
-
-        // Draft model uses 2D position_ids — build a 2D version
+        // Draft model uses 2D position_ids (not mRoPE 3D)
         const size_t total_pos = target_hidden_len + block_ids.size();
         ov::Tensor draft_position_ids(ov::element::i64, {1, total_pos});
         {
@@ -623,6 +858,7 @@ int main(int argc, char* argv[]) try {
         auto draft_end = Clock::now();
         const double draft_ms = duration_ms(draft_start, draft_end);
         perf.draft_wall.add(draft_ms);
+        step_tracked_ms += draft_ms;
 
         auto get_draft_start = Clock::now();
         auto draft_hidden = draft_request.get_tensor("draft_hidden");
@@ -630,7 +866,7 @@ int main(int argc, char* argv[]) try {
         perf.get_tensor_wall.add(duration_ms(get_draft_start, get_draft_end));
 
         // Convert draft_hidden dtype if needed for lm_head
-        const auto& lm_head_port = compiled_lm_head.input("hidden_states");
+        const auto& lm_head_port = lm_head_request.get_compiled_model().input("hidden_states");
         if (draft_hidden.get_element_type() != lm_head_port.get_element_type()) {
             auto convert_start = Clock::now();
             ov::Tensor converted(lm_head_port.get_element_type(), draft_hidden.get_shape());
@@ -671,20 +907,33 @@ int main(int argc, char* argv[]) try {
         block_output_ids.insert(block_output_ids.end(), draft_tokens.begin(), draft_tokens.end());
 
         const size_t verify_len = block_output_ids.size();
-        const size_t kv_len = target_hidden_len + verify_len;
 
-        // Qwen3.5 has linear attention (GatedDeltaNet/Mamba) layers whose
-        // recurrent state cannot be "trimmed" like KV cache.  We must save
-        // the linear states before verification, then restore them and
-        // reprocess only the accepted tokens so that both KV cache and
-        // linear states are correct.
-        auto saved_linear = save_linear_states(target_request);
+        // Save linear states for fallback (only when snapshots unavailable).
+        std::vector<std::pair<std::string, ov::Tensor>> saved_linear;
+        if (!has_snapshots) {
+            saved_linear = save_linear_states(target_request);
+        }
 
+        // Verify
         auto verify_start = Clock::now();
         target_request.set_tensor("input_ids", make_ids_tensor(block_output_ids));
-        target_request.set_tensor("attention_mask", make_attention_mask(kv_len));
+        target_request.set_tensor("attention_mask", make_attention_mask(target_hidden_len + verify_len));
         target_request.set_tensor("position_ids", make_mrope_position_ids(target_hidden_len, verify_len));
         target_request.set_tensor("beam_idx", beam_idx);
+        if (vl_mode) {
+            target_request.set_tensor("visual_embeds", zero_visual_embeds);
+            target_request.set_tensor("visual_pos_mask", zero_visual_pos_mask);
+        }
+
+        if (use_deferred_state_commit && pending_snapshot_commit_index >= 0) {
+            set_target_state_update_mode(-(pending_snapshot_commit_index + 1));
+            pending_snapshot_commit_index = -1;
+        } else if (use_deferred_state_commit) {
+            set_target_state_update_mode(0);
+        } else {
+            set_target_state_update_mode(1);
+        }
+
         target_request.infer();
         auto verify_end = Clock::now();
         const double verify_ms = duration_ms(verify_start, verify_end);
@@ -705,40 +954,66 @@ int main(int argc, char* argv[]) try {
         }
 
         int64_t posterior_next = posterior_tokens[accepted];
-        const size_t num_accepted_verify = accepted + 1;
+        const size_t num_accepted = accepted + 1;
 
-        // Restore linear attention states to pre-verification values.
-        restore_linear_states(target_request, saved_linear);
+        // Multi-path acceptance handling (matching dflash_strategy)
+        const bool all_accepted = (accepted == draft_tokens.size());
+        const bool has_linear_states = has_snapshots || !saved_linear.empty();
+        const bool use_snapshot_restore = has_snapshots &&
+                                          has_linear_states &&
+                                          num_accepted > 0 &&
+                                          (!all_accepted || use_deferred_state_commit);
 
-        // Trim ALL verification tokens from KV cache (full-attention layers).
-        target_kv_state.num_tokens_to_trim = verify_len;
-        ov::genai::utils::trim_kv_cache(target_request, target_kv_state, std::nullopt);
-        target_kv_state.num_tokens_to_trim = 0;
+        if (use_snapshot_restore) {
+            const size_t step = num_accepted - 1;
+            pending_snapshot_commit_index = static_cast<int32_t>(step);
 
-        // Reprocess only accepted tokens.  This correctly advances both
-        // the KV cache (for full-attention layers) and the linear attention
-        // recurrent/conv states by exactly the accepted token count.
-        {
-            std::vector<int64_t> accepted_block(block_output_ids.begin(),
-                                                block_output_ids.begin() + static_cast<ptrdiff_t>(num_accepted_verify));
-            target_request.set_tensor("input_ids", make_ids_tensor(accepted_block));
-            target_request.set_tensor("attention_mask", make_attention_mask(target_hidden_len + num_accepted_verify));
-            target_request.set_tensor("position_ids", make_mrope_position_ids(target_hidden_len, num_accepted_verify));
-            target_request.set_tensor("beam_idx", beam_idx);
-            target_request.infer();
+            const size_t tokens_to_trim = verify_len - num_accepted;
+            target_kv_state.num_tokens_to_trim = tokens_to_trim;
+            ov::genai::utils::trim_kv_cache(target_request, target_kv_state, std::nullopt);
+            target_kv_state.num_tokens_to_trim = 0;
+
+            target_hidden_block = ensure_f32_copy(target_request.get_tensor("target_hidden"));
+        } else if (all_accepted) {
+            target_hidden_block = ensure_f32_copy(target_request.get_tensor("target_hidden"));
+        } else if (!has_linear_states) {
+            const size_t tokens_to_trim = verify_len - num_accepted;
+            target_kv_state.num_tokens_to_trim = tokens_to_trim;
+            ov::genai::utils::trim_kv_cache(target_request, target_kv_state, std::nullopt);
+            target_kv_state.num_tokens_to_trim = 0;
+            target_hidden_block = ensure_f32_copy(target_request.get_tensor("target_hidden"));
+        } else {
+            restore_linear_states(target_request, saved_linear);
+
+            target_kv_state.num_tokens_to_trim = verify_len;
+            ov::genai::utils::trim_kv_cache(target_request, target_kv_state, std::nullopt);
+            target_kv_state.num_tokens_to_trim = 0;
+
+            {
+                std::vector<int64_t> accepted_block(block_output_ids.begin(),
+                                                    block_output_ids.begin() + static_cast<ptrdiff_t>(num_accepted));
+                target_request.set_tensor("input_ids", make_ids_tensor(accepted_block));
+                target_request.set_tensor("attention_mask", make_attention_mask(target_hidden_len + num_accepted));
+                target_request.set_tensor("position_ids", make_mrope_position_ids(target_hidden_len, num_accepted));
+                target_request.set_tensor("beam_idx", beam_idx);
+                if (vl_mode) {
+                    target_request.set_tensor("visual_embeds", zero_visual_embeds);
+                    target_request.set_tensor("visual_pos_mask", zero_visual_pos_mask);
+                }
+                set_target_state_update_mode(1);
+                target_request.infer();
+            }
+
+            target_hidden_block = ensure_f32_copy(target_request.get_tensor("target_hidden"));
         }
 
-        // Update target_hidden storage from the reprocessed (clean) inference.
-        target_hidden_block = ensure_f32_copy(target_request.get_tensor("target_hidden"));
-        const size_t available_space = max_length - target_hidden_len;
-        const size_t num_to_append = std::min(num_accepted_verify, available_space);
-        if (num_to_append > 0) {
-            ov::Tensor accepted_hidden_slice(target_hidden_block, {0, 0, 0}, {1, num_to_append, hidden_dim});
-            ov::Tensor hidden_append_dst(target_hidden_storage,
-                                         {0, target_hidden_len, 0},
-                                         {1, target_hidden_len + num_to_append, hidden_dim});
-            accepted_hidden_slice.copy_to(hidden_append_dst);
-            target_hidden_len += num_to_append;
+        if (num_accepted > 0 && target_hidden_len + num_accepted <= max_length + static_cast<size_t>(dflash_cfg.block_size)) {
+            ov::Tensor src_slice(target_hidden_block, {0, 0, 0}, {1, num_accepted, hidden_dim});
+            ov::Tensor dst_slice(target_hidden_storage,
+                                 {0, target_hidden_len, 0},
+                                 {1, target_hidden_len + num_accepted, hidden_dim});
+            src_slice.copy_to(dst_slice);
+            target_hidden_len += num_accepted;
         }
 
         auto postproc_start = Clock::now();
@@ -749,15 +1024,11 @@ int main(int argc, char* argv[]) try {
             output_ids.push_back(draft_tokens[i]);
             newly_accepted.push_back(draft_tokens[i]);
         }
-        // Stream print accepted draft tokens
-        if (!newly_accepted.empty()) {
-            auto accepted_text = tokenizer.decode(newly_accepted, {ov::genai::skip_special_tokens(true)});
-            std::cout << accepted_text << std::flush;
-        }
+
         const size_t accepted_pushed = output_ids.size() - before_accept;
         ++perf.draft_steps;
-        perf.accepted_tokens += accepted_pushed + 1;
-        perf.accepted_per_step.push_back(accepted_pushed + 1);
+        perf.accepted_tokens += accepted_pushed;  // draft-only (matches pipeline convention)
+        perf.accepted_per_step.push_back(accepted_pushed);
         auto postproc_end = Clock::now();
         perf.postproc_wall.add(duration_ms(postproc_start, postproc_end));
 
@@ -765,10 +1036,6 @@ int main(int argc, char* argv[]) try {
 
         next_token = posterior_next;
         output_ids.push_back(next_token);
-        // Stream print posterior token
-        auto posterior_text = tokenizer.decode({posterior_next}, {ov::genai::skip_special_tokens(true)});
-        std::cout << posterior_text << std::flush;
-
         // Check if posterior token is EOS
         if (posterior_next == eos_token_id) {
             stopped_by_eos = true;
@@ -785,43 +1052,50 @@ int main(int argc, char* argv[]) try {
     perf.total_generate_ms = duration_ms(generation_start, generation_end);
     perf.generated_tokens = output_ids.size() - prompt_len;
 
-    std::cout << "\n\n[Generation Complete]" << std::endl;
+    // Batch decode all generated tokens at once
+    std::vector<int64_t> generated_ids(output_ids.begin() + static_cast<ptrdiff_t>(prompt_len), output_ids.end());
+    auto output_text = tokenizer.decode(generated_ids, {ov::genai::skip_special_tokens(true)});
+    std::cout << "\n\n[Output]\n" << output_text << std::endl;
+    std::cout << "\n[Generation Complete]" << std::endl;
     std::cout << "[Stop Reason] " << (stopped_by_eos ? "EOS token detected" : "Max length reached") << "\n" << std::endl;
 
-    const size_t tokens_after_first = perf.generated_tokens > 0 ? perf.generated_tokens - 1 : 0;
-    const double tpot_ms = tokens_after_first > 0
-                               ? (perf.total_generate_ms - perf.ttft_ms) / static_cast<double>(tokens_after_first)
-                               : 0.0;
     dflash_throughput = perf.total_generate_ms > 0
                             ? (static_cast<double>(perf.generated_tokens) * 1000.0) / perf.total_generate_ms
                             : 0.0;
     const double avg_accept = perf.draft_steps > 0
                                   ? static_cast<double>(perf.accepted_tokens) / static_cast<double>(perf.draft_steps)
                                   : 0.0;
-    const size_t target_generated = perf.generated_tokens > perf.accepted_tokens
-                                        ? perf.generated_tokens - perf.accepted_tokens
-                                        : 0;
+    const double acceptance_rate = perf.generated_tokens > 0
+                                      ? static_cast<double>(perf.accepted_tokens) / static_cast<double>(perf.generated_tokens)
+                                      : 0.0;
+    const size_t tokens_after_first = perf.generated_tokens > 0 ? perf.generated_tokens - 1 : 0;
+    const double tpot_ms = tokens_after_first > 0
+                               ? perf.total_generate_ms / static_cast<double>(tokens_after_first)
+                               : 0.0;
 
-    std::cout << std::fixed << std::setprecision(3);
-    std::cout << "[Tokens] prompt=" << prompt_len << ", generated=" << perf.generated_tokens
-              << ", draft_accepted=" << perf.accepted_tokens << ", target_only=" << target_generated
-              << ", avg_accept_per_block=" << avg_accept << std::endl;
-    std::cout << "[Latency] TTFT=" << perf.ttft_ms << " ms, TPOT=" << tpot_ms
-              << " ms/token, total_generate=" << perf.total_generate_ms
-              << " ms, throughput=" << dflash_throughput << " tokens/s" << std::endl;
-    std::cout << "[Verify Stats] total verify calls=" << perf.verify_wall.count
-              << ", draft_steps=" << perf.draft_steps << std::endl;
+    std::cout << std::fixed << std::setprecision(2);
+    // Print summary in same format as modeling_qwen3_5 baseline for batch script parsing
+    std::cout << "Mode: dflash / text" << std::endl;
+    std::cout << "Prompt token size: " << prompt_len << std::endl;
+    std::cout << "Output token size: " << perf.generated_tokens << std::endl;
+    std::cout << "TTFT: " << perf.ttft_ms << " ms" << std::endl;
+    std::cout << "Decode time: " << perf.total_generate_ms << " ms" << std::endl;
+    std::cout << "TPOT: " << tpot_ms << " ms/token" << std::endl;
+    std::cout << "Throughput: " << dflash_throughput << " tokens/s" << std::endl;
+    std::cout << "Draft steps: " << perf.draft_steps << std::endl;
+    std::cout << "Accepted draft tokens: " << perf.accepted_tokens << std::endl;
+    std::cout << "Acceptance rate: " << std::setprecision(4) << acceptance_rate << std::endl;
+    std::cout << std::setprecision(2);
+    std::cout << "Avg accepted per step: " << avg_accept << std::endl;
+
+    std::cout << std::setprecision(3);
     std::cout << "[Stage timings] wall-clock (ms):" << std::endl;
     print_stage_stats("prefill target", perf.prefill_wall);
-    print_stage_stats("target ctx", perf.target_ctx_wall);
     print_stage_stats("embed", perf.embed_wall);
     print_stage_stats("draft", perf.draft_wall);
     print_stage_stats("lm_head", perf.lm_head_wall);
     print_stage_stats("target verify", perf.verify_wall);
-    print_stage_stats("prep", perf.prep_wall);
     print_stage_stats("postproc", perf.postproc_wall);
-    print_stage_stats("kv trim", perf.kv_trim_wall);
-    print_stage_stats("hidden append", perf.hidden_append_wall);
     print_stage_stats("set_tensor", perf.set_tensor_wall);
     print_stage_stats("get_tensor", perf.get_tensor_wall);
     print_stage_stats("argmax", perf.argmax_wall);
@@ -834,50 +1108,6 @@ int main(int argc, char* argv[]) try {
             std::cout << perf.accepted_per_step[i];
         }
         std::cout << "]" << std::endl;
-    }
-
-    // =====================================================================
-    // Baseline: run the standard Qwen3.5 text model for comparison
-    // =====================================================================
-    std::cout << std::endl << "=====Run Baseline Qwen3.5 model for comparison=====" << std::endl;
-
-    auto baseline_model = ov::genai::modeling::models::create_qwen3_5_text_model(
-        target_qwen35_cfg, target_source, target_finalizer, false, false);
-    auto compiled_baseline = core.compile_model(baseline_model, device, compile_cfg);
-    auto baseline_request = compiled_baseline.create_infer_request();
-    const auto baseline_beam_idx = make_beam_idx(1);
-    baseline_request.reset_state();
-    auto baseline = run_target_baseline(baseline_request, baseline_beam_idx, prompt_ids, max_new_tokens, eos_token_id);
-    const size_t baseline_tokens_after_first = baseline.stats.generated_tokens > 0 ? baseline.stats.generated_tokens - 1 : 0;
-    const double baseline_tpot_ms = baseline_tokens_after_first > 0
-                                        ? (baseline.stats.total_generate_ms - baseline.stats.ttft_ms)
-                                              / static_cast<double>(baseline_tokens_after_first)
-                                        : 0.0;
-    const double baseline_throughput = baseline.stats.total_generate_ms > 0
-                                           ? (static_cast<double>(baseline.stats.generated_tokens) * 1000.0)
-                                                 / baseline.stats.total_generate_ms
-                                           : 0.0;
-
-    std::cout << "[Target-only] generated=" << baseline.stats.generated_tokens
-              << ", TTFT=" << baseline.stats.ttft_ms << " ms, TPOT=" << baseline_tpot_ms
-              << " ms/token, total_generate=" << baseline.stats.total_generate_ms
-              << " ms, throughput=" << baseline_throughput << " tokens/s" << std::endl;
-    std::cout << "[Target-only stage timings] wall-clock (ms):" << std::endl;
-    print_stage_stats("prefill target", baseline.stats.prefill_wall);
-    print_stage_stats("decode target", baseline.stats.decode_wall);
-    auto text_original = tokenizer.decode(baseline.output_ids, {ov::genai::skip_special_tokens(true)});
-    std::cout << text_original << std::endl;
-
-    const size_t dflash_tokens_after_first = perf.generated_tokens > 0 ? perf.generated_tokens - 1 : 0;
-    const double dflash_tpot_ms = dflash_tokens_after_first > 0
-                                     ? (perf.total_generate_ms - perf.ttft_ms)
-                                           / static_cast<double>(dflash_tokens_after_first)
-                                     : 0.0;
-    if (baseline_throughput > 0.0 && dflash_throughput > 0.0) {
-        std::cout << "[Compare] dflash / baseline throughput ratio=" << (dflash_throughput / baseline_throughput) << std::endl;
-    }
-    if (baseline_tpot_ms > 0.0 && dflash_tpot_ms > 0.0) {
-        std::cout << "[Compare] Decoding speedup: " << (baseline_tpot_ms / dflash_tpot_ms) << std::endl;
     }
 
     return 0;

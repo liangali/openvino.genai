@@ -221,9 +221,12 @@ set_target_properties(modeling_dflash PROPERTIES
 # Qwen3.5 DFlash sample
 add_executable(modeling_qwen3_5_dflash
     modeling_qwen3_5_dflash.cpp
+    "${OpenVINOGenAI_SOURCE_DIR}/samples/cpp/visual_language_chat/load_image.cpp"
     $<TARGET_OBJECTS:openvino_genai_obj>)
 
 target_include_directories(modeling_qwen3_5_dflash PRIVATE
+    "${CMAKE_BINARY_DIR}"
+    "${OpenVINOGenAI_SOURCE_DIR}/samples/cpp/visual_language_chat"
     "${OpenVINOGenAI_SOURCE_DIR}/src/cpp/src"
     "${OpenVINOGenAI_SOURCE_DIR}/openvino/thirdparty/json/nlohmann_json/include"
     $<TARGET_PROPERTY:openvino::genai,INTERFACE_INCLUDE_DIRECTORIES>)

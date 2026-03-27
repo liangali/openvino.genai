@@ -266,7 +266,9 @@ public:
         const Tensor* linear_attention_mask,
         const Tensor* cache_position,
         const Tensor* state_update_mode,
-        const std::vector<int32_t>& layer_ids);
+        const std::vector<int32_t>& layer_ids,
+        const Tensor* visual_embeds = nullptr,
+        const Tensor* visual_pos_mask = nullptr);
 
 private:
     Tensor forward_impl(const Tensor* input_ids,
@@ -339,7 +341,8 @@ std::shared_ptr<ov::Model> create_qwen3_5_dflash_target_model(
     const std::vector<int32_t>& target_layer_ids,
     ov::genai::modeling::weights::WeightSource& source,
     ov::genai::modeling::weights::WeightFinalizer& finalizer,
-    int32_t snapshot_block_size = 0);
+    int32_t snapshot_block_size = 0,
+    bool enable_visual_inputs = false);
 
 std::shared_ptr<ov::Model> create_qwen3_5_embedding_model(
     const Qwen3_5Config& cfg,
