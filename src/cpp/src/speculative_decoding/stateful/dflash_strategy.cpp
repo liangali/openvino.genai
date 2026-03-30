@@ -345,7 +345,15 @@ DecodedResults StatefulDFlashPipeline::generate(
     try {
         if (!m_tokenizer.get_chat_template().empty()) {
             ChatHistory history({{{"role", "user"}, {"content", prompt}}});
-            formatted_prompt = m_tokenizer.apply_chat_template(history, true);
+            // Honour OV_GENAI_DISABLE_THINKING=1 (same env var as the standalone exe)
+            const char* raw = std::getenv("OV_GENAI_DISABLE_THINKING");
+            bool disable_thinking = raw && std::string(raw) == "1";
+            if (disable_thinking) {
+                ov::genai::JsonContainer extra({{"enable_thinking", false}});
+                formatted_prompt = m_tokenizer.apply_chat_template(history, true, {}, std::nullopt, extra);
+            } else {
+                formatted_prompt = m_tokenizer.apply_chat_template(history, true);
+            }
             add_special = false;
         }
     } catch (...) {}
@@ -555,9 +563,6 @@ EncodedResults StatefulDFlashPipeline::generate(
                       << " total_pos=" << total_pos << std::endl;
         }
         m_draft_request.infer();
-        if (stat_draft_steps == 0) {
-            std::cerr << "[DFlash GPU MEM] Draft step #0 infer done." << std::endl;
-        }
 
         auto draft_logits = m_draft_request.get_tensor("logits");
 

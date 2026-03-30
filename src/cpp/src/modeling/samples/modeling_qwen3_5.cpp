@@ -41,6 +41,14 @@
 #include "modeling/weights/synthetic_weight_source.hpp"
 #include "sampling/logit_processor.hpp"
 
+#ifdef _WIN32
+#  define NOMINMAX
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#  include <shellapi.h>   // CommandLineToArgvW
+#  pragma comment(lib, "shell32.lib")
+#endif
+
 namespace {
 
 struct SampleOptions {
@@ -780,6 +788,25 @@ ov::Tensor make_dummy_image() {
 }  // namespace
 
 int main(int argc, char* argv[]) try {
+#ifdef _WIN32
+    // On Windows, argv is encoded in the system ANSI codepage (e.g. GBK),
+    // which corrupts non-ASCII characters like curly quotes and em dashes.
+    // Use the native wide-char command line and convert to UTF-8.
+    int wargc = 0;
+    wchar_t** wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+    std::vector<std::string> utf8_args(wargc);
+    std::vector<char*> utf8_argv(wargc);
+    for (int i = 0; i < wargc; ++i) {
+        int len = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, nullptr, 0, nullptr, nullptr);
+        utf8_args[i].resize(len - 1);  // len includes null terminator
+        WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, utf8_args[i].data(), len, nullptr, nullptr);
+        utf8_argv[i] = utf8_args[i].data();
+    }
+    LocalFree(wargv);
+    argc = wargc;
+    argv = utf8_argv.data();
+#endif
+
     if (argc == 1) {
         print_usage(argv[0]);
         return 0;
