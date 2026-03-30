@@ -1219,9 +1219,6 @@ int main(int argc, char* argv[]) try {
             }
         }
     }
-    // Pre-allocate USM-host tensor for decode position_ids - reuse across steps
-    // to avoid per-step create_host_tensor() + memcpy overhead.
-    // Shape: [3, batch, 1] (3 planes of identical position values per batch element)
     ov::Tensor usm_decode_pos = make_usm_host_tensor(gpu_ctx, ov::element::i64, {3, batch, 1});
     const int64_t* rope_deltas_data = plan.rope_deltas.data<const int64_t>();
 

@@ -363,6 +363,46 @@ std::shared_ptr<ov::Model> create_qwen3_5_draft_helper_model(
     ov::genai::modeling::weights::WeightFinalizer& finalizer,
     const ov::element::Type& lm_head_input_type = ov::element::f32);
 
+// Forward declaration (defined in dflash_draft.hpp).
+struct DFlashDraftConfig;
+
+/// Combined embed + draft + lm_head model.  Merges three GPU dispatches into
+/// one infer() call per draft step, eliminating kernel-launch & sync overhead.
+/// Inputs:  target_hidden [B, T, hidden*num_draft_layers],
+///          input_ids     [B, block_size],
+///          position_ids  [1, T+block_size]
+/// Output:  logits        [B, block_size, vocab_size]
+std::shared_ptr<ov::Model> create_qwen3_5_dflash_combined_draft_model(
+    const Qwen3_5Config& qwen_cfg,
+    const DFlashDraftConfig& draft_cfg,
+    ov::genai::modeling::weights::WeightSource& target_source,
+    ov::genai::modeling::weights::WeightFinalizer& target_finalizer,
+    ov::genai::modeling::weights::WeightSource& draft_source,
+    ov::genai::modeling::weights::WeightFinalizer& draft_finalizer);
+
+/// Context KV preprocessing model.  Computes fc + RMSNorm + K,V projections +
+/// KNorm + RoPE for all draft layers.  Runs once per verify cycle on newly
+/// accepted tokens.
+/// Inputs:  target_hidden [1, A, ctx_dim], position_ids [1, A]
+/// Outputs: context_k_i [1, kv_heads, A, head_dim], context_v_i (×num_layers)
+std::shared_ptr<ov::Model> create_qwen3_5_dflash_context_kv_model(
+    const DFlashDraftConfig& draft_cfg,
+    ov::genai::modeling::weights::WeightSource& draft_source,
+    ov::genai::modeling::weights::WeightFinalizer& draft_finalizer);
+
+/// Lightweight draft step model.  Embed → attention using pre-computed context
+/// K,V → MLP → LM head.  Skips fc + context KV computation entirely.
+/// Inputs:  input_ids [1, B], position_ids [1, B],
+///          context_k_i / context_v_i [1, kv_heads, T, head_dim] (×num_layers)
+/// Output:  logits [1, B, vocab_size]
+std::shared_ptr<ov::Model> create_qwen3_5_dflash_step_model(
+    const Qwen3_5Config& qwen_cfg,
+    const DFlashDraftConfig& draft_cfg,
+    ov::genai::modeling::weights::WeightSource& target_source,
+    ov::genai::modeling::weights::WeightFinalizer& target_finalizer,
+    ov::genai::modeling::weights::WeightSource& draft_source,
+    ov::genai::modeling::weights::WeightFinalizer& draft_finalizer);
+
 }  // namespace models
 }  // namespace modeling
 }  // namespace genai

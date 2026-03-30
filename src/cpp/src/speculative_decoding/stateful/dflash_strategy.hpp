@@ -57,9 +57,7 @@ public:
 private:
     // Sub-model infer requests
     ov::InferRequest m_target_request;
-    ov::InferRequest m_draft_request;
-    ov::InferRequest m_embed_request;
-    ov::InferRequest m_lm_head_request;
+    ov::InferRequest m_draft_request;  // Combined: embed + draft + lm_head
 
     // Config
     int32_t m_block_size = 16;

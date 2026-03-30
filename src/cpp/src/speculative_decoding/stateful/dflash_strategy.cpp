@@ -123,11 +123,9 @@ StatefulDFlashPipeline::StatefulDFlashPipeline(
         draft_finalizer  = safetensors::SafetensorsWeightFinalizer(dflash_cfg.draft_quantization_config.value());
     auto target_model = modeling::models::create_qwen3_5_dflash_target_model(
         target_qwen35_cfg, m_target_layer_ids, target_source, target_finalizer, m_block_size);
-    auto draft_model = modeling::models::create_dflash_draft_model(
-        dc, draft_source, draft_finalizer, ov::element::f32);
-        // Draft helper model (for combined embed + lm_head path in draft)
-    auto draft_helper_model = modeling::models::create_qwen3_5_draft_helper_model(
-        target_qwen35_cfg, target_source, target_finalizer, ov::element::f32);
+    auto combined_draft_model = modeling::models::create_qwen3_5_dflash_combined_draft_model(
+        target_qwen35_cfg, dc, target_source, target_finalizer,
+        draft_source, draft_finalizer);
 
     // Compile
     ov::Core core;
@@ -143,20 +141,12 @@ StatefulDFlashPipeline::StatefulDFlashPipeline(
     auto compiled_target = core.compile_model(target_model, device, compile_cfg);
     std::cerr << "[DFlash GPU MEM] Target compiled." << std::endl;
 
-    std::cerr << "[DFlash GPU MEM] Compiling draft model..." << std::endl;
-    auto compiled_draft = core.compile_model(draft_model, device, compile_cfg);
-    std::cerr << "[DFlash GPU MEM] Draft compiled." << std::endl;
-
-    std::cerr << "[DFlash GPU MEM] Compiling draft_helper model (embed+lm_head combined)..." << std::endl;
-    auto compiled_draft_helper = core.compile_model(draft_helper_model, device, compile_cfg);
-    std::cerr << "[DFlash GPU MEM] All 3 models compiled." << std::endl;
+    std::cerr << "[DFlash GPU MEM] Compiling combined draft model (embed+draft+lm_head)..." << std::endl;
+    auto compiled_draft = core.compile_model(combined_draft_model, device, compile_cfg);
+    std::cerr << "[DFlash GPU MEM] All 2 models compiled." << std::endl;
 
     m_target_request = compiled_target.create_infer_request();
     m_draft_request = compiled_draft.create_infer_request();
-    // Two InferRequests from the same CompiledModel share GPU weight memory.
-    // embed_request reads "embeddings", lm_head_request reads "logits".
-    m_embed_request = compiled_draft_helper.create_infer_request();
-    m_lm_head_request = compiled_draft_helper.create_infer_request();
 
     // Log state counts
     {
@@ -532,24 +522,6 @@ EncodedResults StatefulDFlashPipeline::generate(
     output_ids.push_back(next_token);
     bool stopped = stream_token(next_token) || should_stop_on_token(next_token);
 
-    // Pre-set dummy tensors for unused paths in the combined draft_helper model.
-    // The embed_request only reads "embeddings" output, and lm_head_request only
-    // reads "logits" output, but the combined model computes both per call.
-    // Minimal [1,1,...] inputs make the unused path's compute negligible.
-    // Note: m_hidden_dim is target_hidden dim (hidden_size * num_target_layers),
-    // NOT lm_head's expected input dim (hidden_size). Query from model port.
-    {
-        const auto& hs_port = m_embed_request.get_compiled_model().input("hidden_states");
-        size_t lm_hidden = static_cast<size_t>(hs_port.get_partial_shape()[2].get_length());
-        ov::Tensor dummy_hidden(ov::element::f32, {1, 1, lm_hidden});
-        std::memset(dummy_hidden.data(), 0, dummy_hidden.get_byte_size());
-        m_embed_request.set_tensor("hidden_states", dummy_hidden);
-
-        ov::Tensor dummy_ids(ov::element::i64, {1, 1});
-        dummy_ids.data<int64_t>()[0] = 0;
-        m_lm_head_request.set_tensor("input_ids", dummy_ids);
-    }
-
     // ── Decode loop ──
     while (output_ids.size() < max_length && !stopped) {
         if (should_stop_on_token(next_token)) break;
@@ -559,11 +531,6 @@ EncodedResults StatefulDFlashPipeline::generate(
         block_ids[0] = output_ids.back();
 
         auto small_decode_start = Clock::now();
-
-        // Embed
-        m_embed_request.set_tensor("input_ids", make_ids_tensor(block_ids));
-        m_embed_request.infer();
-        auto noise_embedding = m_embed_request.get_tensor("embeddings");
 
         // Draft position_ids (2D)
         const size_t total_pos = target_hidden_len + block_ids.size();
@@ -576,15 +543,15 @@ EncodedResults StatefulDFlashPipeline::generate(
                 pd[i] = static_cast<int64_t>(target_hidden_len - 1 + (i - target_hidden_len));
         }
 
-        // Run draft
+        // Run combined draft model (embed + draft + lm_head in one GPU dispatch)
         ov::Tensor hidden_view(target_hidden_storage, {0, 0, 0}, {1, target_hidden_len, m_hidden_dim});
         m_draft_request.set_tensor("target_hidden", hidden_view);
-        m_draft_request.set_tensor("noise_embedding", noise_embedding);
+        m_draft_request.set_tensor("input_ids", make_ids_tensor(block_ids));
         m_draft_request.set_tensor("position_ids", draft_pos);
         if (stat_draft_steps == 0) {
             std::cerr << "[DFlash GPU MEM] Draft step #0: target_hidden=[1,"
                       << target_hidden_len << "," << m_hidden_dim
-                      << "] noise_embedding=" << noise_embedding.get_shape()
+                      << "] block_size=" << block_ids.size()
                       << " total_pos=" << total_pos << std::endl;
         }
         m_draft_request.infer();
@@ -592,19 +559,7 @@ EncodedResults StatefulDFlashPipeline::generate(
             std::cerr << "[DFlash GPU MEM] Draft step #0 infer done." << std::endl;
         }
 
-        auto draft_hidden = m_draft_request.get_tensor("draft_hidden");
-        // Convert dtype if needed
-        const auto& lm_port = m_lm_head_request.get_compiled_model().input("hidden_states");
-        if (draft_hidden.get_element_type() != lm_port.get_element_type()) {
-            ov::Tensor converted(lm_port.get_element_type(), draft_hidden.get_shape());
-            draft_hidden.copy_to(converted);
-            draft_hidden = converted;
-        }
-
-        // LM head
-        m_lm_head_request.set_tensor("hidden_states", draft_hidden);
-        m_lm_head_request.infer();
-        auto draft_logits = m_lm_head_request.get_tensor("logits");
+        auto draft_logits = m_draft_request.get_tensor("logits");
 
         // Argmax draft tokens (skip pos 0)
         const size_t draft_len = block_ids.size() - 1;
