@@ -619,7 +619,7 @@ bool is_language_tag_token(const std::string& token) {
 
 std::string detect_language_from_tokens(ov::genai::Tokenizer& tokenizer, const std::vector<int64_t>& generated_ids) {
     for (size_t i = 0; i < generated_ids.size() && i < 8; ++i) {
-        const std::string token = tokenizer.decode({generated_ids[i]}, {ov::genai::skip_special_tokens(false)});
+        const std::string token = tokenizer.decode(std::vector<int64_t>{generated_ids[i]}, ov::AnyMap{ov::genai::skip_special_tokens(false)});
         if (is_language_tag_token(token)) {
             return token;
         }
@@ -633,7 +633,7 @@ std::string detect_language_from_language_prefix_tokens(ov::genai::Tokenizer& to
         return {};
     }
 
-    std::string first = trim_copy(tokenizer.decode({generated_ids[0]}, {ov::genai::skip_special_tokens(false)}));
+    std::string first = trim_copy(tokenizer.decode(std::vector<int64_t>{generated_ids[0]}, ov::AnyMap{ov::genai::skip_special_tokens(false)}));
     std::string first_lower = first;
     std::transform(first_lower.begin(), first_lower.end(), first_lower.begin(), [](unsigned char c) {
         return static_cast<char>(std::tolower(c));
@@ -642,7 +642,7 @@ std::string detect_language_from_language_prefix_tokens(ov::genai::Tokenizer& to
         return {};
     }
 
-    const std::string second = trim_copy(tokenizer.decode({generated_ids[1]}, {ov::genai::skip_special_tokens(false)}));
+    const std::string second = trim_copy(tokenizer.decode(std::vector<int64_t>{generated_ids[1]}, ov::AnyMap{ov::genai::skip_special_tokens(false)}));
     if (second.empty()) {
         return {};
     }
@@ -1394,7 +1394,7 @@ int main(int argc, char* argv[]) try {
         }
         preview += std::to_string(generated_ids[i]);
         preview += ":";
-        preview += tokenizer.decode({generated_ids[i]}, {ov::genai::skip_special_tokens(false)});
+        preview += tokenizer.decode(std::vector<int64_t>{generated_ids[i]}, ov::AnyMap{ov::genai::skip_special_tokens(false)});
     }
 
     std::cout << "Qwen3-ASR smoke run completed" << std::endl;

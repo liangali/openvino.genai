@@ -739,7 +739,7 @@ int main(int argc, char* argv[]) try {
         std::cout << "\n[Streaming Output]\n";
         auto prompt_text = tokenizer.decode(prompt_ids, {ov::genai::skip_special_tokens(true)});
         std::cout << prompt_text;
-        auto first_token_text = tokenizer.decode({next_token}, {ov::genai::skip_special_tokens(true)});
+        auto first_token_text = tokenizer.decode(std::vector<int64_t>{next_token}, ov::AnyMap{ov::genai::skip_special_tokens(true)});
         std::cout << first_token_text << std::flush;
 
         const auto generation_start = Clock::now();
@@ -972,7 +972,7 @@ int main(int argc, char* argv[]) try {
             next_token = posterior_next;
             output_ids.push_back(next_token);
             // Stream print posterior token
-            auto posterior_text = tokenizer.decode({posterior_next}, {ov::genai::skip_special_tokens(true)});
+            auto posterior_text = tokenizer.decode(std::vector<int64_t>{posterior_next}, ov::AnyMap{ov::genai::skip_special_tokens(true)});
             std::cout << posterior_text << std::flush;
             
             // Check if posterior token is EOS
