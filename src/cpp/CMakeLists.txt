@@ -257,8 +257,8 @@ endif()
 # Add native CPU optimization for SIMD instructions
 if (ARCH_DIR STREQUAL "intel64")
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        # Force AVX2 only (disable AVX512)
-        target_compile_options(${TARGET_NAME_OBJ} PRIVATE "-mavx2" "-mno-avx512f")
+        # Force AVX2 only (disable AVX512), enable F16C for FP16 conversion intrinsics
+        target_compile_options(${TARGET_NAME_OBJ} PRIVATE "-mavx2" "-mf16c" "-mno-avx512f")
         message(STATUS "Enable SIMD compilation for ${TARGET_NAME_OBJ}")
     elseif(MSVC)
         target_compile_options(${TARGET_NAME_OBJ} PRIVATE "/arch:AVX2")
