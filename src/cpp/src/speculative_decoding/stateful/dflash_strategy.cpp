@@ -462,7 +462,7 @@ EncodedResults StatefulDFlashPipeline::generate(
 
     auto stream_token = [&](int64_t token) -> bool {
         if (streamer_fn) {
-            auto text = m_tokenizer.decode({token}, {ov::genai::skip_special_tokens(true)});
+            auto text = m_tokenizer.decode(std::vector<int64_t>{token}, ov::AnyMap{ov::genai::skip_special_tokens(true)});
             return streamer_fn(text) != StreamingStatus::RUNNING;
         }
         if (streamer_ptr) {
