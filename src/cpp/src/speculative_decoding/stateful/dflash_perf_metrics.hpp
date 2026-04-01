@@ -27,6 +27,8 @@ struct DFlashPerfMetrics : public ov::genai::ExtendedPerfMetrics {
     double draft_acceptance_rate = 0.0;
     // Per-step accepted count (length == draft_steps)
     std::vector<size_t> accepted_per_step;
+    // Per-step accepted token IDs (each inner vector = accepted drafts + posterior_next)
+    std::vector<std::vector<int64_t>> accepted_tokens_per_step;
 
     // Total wall-clock time for full small-model decode path per step
     // (embed + draft + lm_head + argmax), ms

@@ -400,6 +400,7 @@ EncodedResults StatefulDFlashPipeline::generate(
     size_t stat_draft_steps    = 0;
     size_t stat_accepted_total = 0;  // accepted draft tokens (not counting posterior)
     std::vector<size_t> stat_accepted_per_step;
+    std::vector<std::vector<int64_t>> stat_accepted_tokens_per_step;
     // Full small-model decode time per speculation step:
     // embed + draft + lm_head + argmax
     double stat_draft_total_ms = 0.0;
@@ -654,6 +655,12 @@ EncodedResults StatefulDFlashPipeline::generate(
         ++stat_draft_steps;
         stat_accepted_total += accepted;
         stat_accepted_per_step.push_back(accepted);
+        {
+            std::vector<int64_t> step_tokens;
+            for (size_t i = 0; i < accepted; ++i) step_tokens.push_back(draft_tokens[i]);
+            step_tokens.push_back(posterior_next);
+            stat_accepted_tokens_per_step.push_back(std::move(step_tokens));
+        }
 
         // Dense-style vs hybrid-style acceptance handling:
         const bool all_accepted = (accepted == draft_tokens.size());
@@ -769,6 +776,7 @@ EncodedResults StatefulDFlashPipeline::generate(
         ? static_cast<double>(stat_accepted_total) / static_cast<double>(generated)
         : 0.0;
     dflash_metrics->accepted_per_step      = stat_accepted_per_step;
+    dflash_metrics->accepted_tokens_per_step = std::move(stat_accepted_tokens_per_step);
     dflash_metrics->draft_total_ms         = stat_draft_total_ms;
     dflash_metrics->avg_draft_step_ms      = stat_draft_steps > 0
         ? stat_draft_total_ms / static_cast<double>(stat_draft_steps)

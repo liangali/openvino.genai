@@ -943,10 +943,23 @@ int main(int argc, char* argv[]) try {
             output_ids.push_back(draft_tokens[i]);
         }
 
-        const size_t accepted_pushed = output_ids.size() - before_accept;
         ++perf.draft_steps;
-        perf.accepted_tokens += accepted_pushed;  // draft-only (matches pipeline convention)
-        perf.accepted_per_step.push_back(accepted_pushed);
+        perf.accepted_tokens += accepted;  // raw acceptance (before max_length clipping, matches pipeline)
+        perf.accepted_per_step.push_back(accepted);
+        {
+            std::vector<int64_t> step_toks;
+            for (size_t i = 0; i < accepted; ++i)
+                step_toks.push_back(draft_tokens[i]);
+            step_toks.push_back(posterior_next);
+            auto text = tokenizer.decode(step_toks, {ov::genai::skip_special_tokens(true)});
+            std::cout << "[Step " << perf.draft_steps << "] accepted=" << accepted
+                      << " ids=[";
+            for (size_t i = 0; i < step_toks.size(); ++i) {
+                if (i) std::cout << ",";
+                std::cout << step_toks[i];
+            }
+            std::cout << "] [" << text << "]" << std::endl;
+        }
         auto postproc_end = Clock::now();
         perf.postproc_wall.add(duration_ms(postproc_start, postproc_end));
 

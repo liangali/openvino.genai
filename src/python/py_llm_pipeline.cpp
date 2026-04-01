@@ -280,6 +280,7 @@ void init_llm_pipeline(py::module_& m) {
         .def_readonly("avg_accepted_per_step",  &ov::genai::DFlashPerfMetrics::avg_accepted_per_step)
         .def_readonly("draft_acceptance_rate",  &ov::genai::DFlashPerfMetrics::draft_acceptance_rate)
         .def_readonly("accepted_per_step",      &ov::genai::DFlashPerfMetrics::accepted_per_step)
+        .def_readonly("accepted_tokens_per_step", &ov::genai::DFlashPerfMetrics::accepted_tokens_per_step)
         .def_readonly("draft_total_ms",         &ov::genai::DFlashPerfMetrics::draft_total_ms)
         .def_readonly("avg_draft_step_ms",      &ov::genai::DFlashPerfMetrics::avg_draft_step_ms)
         .def_readonly("avg_accepted_draft_token_ms", &ov::genai::DFlashPerfMetrics::avg_accepted_draft_token_ms)
