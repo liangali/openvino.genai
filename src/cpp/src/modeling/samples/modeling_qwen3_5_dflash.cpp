@@ -16,8 +16,10 @@
 #include <vector>
 
 #include <openvino/openvino.hpp>
+#include <openvino/opsets/opset1.hpp>
 #include <openvino/core/type/bfloat16.hpp>
 #include <openvino/core/type/float16.hpp>
+#include <openvino/runtime/intel_gpu/properties.hpp>
 
 #include "openvino/genai/tokenizer.hpp"
 #include "loaders/model_config.hpp"
@@ -133,6 +135,13 @@ ov::Tensor ensure_f32_copy(const ov::Tensor& t) {
     return out;
 }
 
+// Copy GPU tensor to CPU preserving native element type (avoids f16→f32 conversion overhead)
+ov::Tensor copy_to_host(const ov::Tensor& t) {
+    ov::Tensor out(t.get_element_type(), t.get_shape());
+    t.copy_to(out);
+    return out;
+}
+
 template <typename T>
 int64_t argmax_row(const T* data, size_t vocab) {
     T max_val = data[0];
@@ -140,6 +149,27 @@ int64_t argmax_row(const T* data, size_t vocab) {
     for (size_t i = 1; i < vocab; ++i) {
         if (data[i] > max_val) {
             max_val = data[i];
+            max_idx = i;
+        }
+    }
+    return static_cast<int64_t>(max_idx);
+}
+
+// Fast f16 argmax: compare as uint16_t with sign-magnitude→sortable transform.
+// IEEE 754 f16: sign(1) | exp(5) | mantissa(10). For positive floats, uint16_t
+// comparison gives correct ordering. For negatives, bit-flip maps to correct order.
+int64_t argmax_row_f16_fast(const uint16_t* data, size_t vocab) {
+    // Transform: if sign bit set (negative), flip all bits; else flip only sign bit.
+    // This maps f16 ordering to uint16_t ordering for all finite values.
+    auto to_sortable = [](uint16_t v) -> uint16_t {
+        return (v & 0x8000) ? static_cast<uint16_t>(~v) : static_cast<uint16_t>(v ^ 0x8000);
+    };
+    uint16_t max_val = to_sortable(data[0]);
+    size_t max_idx = 0;
+    for (size_t i = 1; i < vocab; ++i) {
+        uint16_t sv = to_sortable(data[i]);
+        if (sv > max_val) {
+            max_val = sv;
             max_idx = i;
         }
     }
@@ -161,9 +191,9 @@ std::vector<int64_t> argmax_logits_slice(const ov::Tensor& logits, size_t start,
     tokens.reserve(count);
 
     if (logits.get_element_type() == ov::element::f16) {
-        const auto* data = logits.data<const ov::float16>();
+        const auto* data = reinterpret_cast<const uint16_t*>(logits.data<const ov::float16>());
         for (size_t i = 0; i < count; ++i)
-            tokens.push_back(argmax_row(data + (start + i) * vocab, vocab));
+            tokens.push_back(argmax_row_f16_fast(data + (start + i) * vocab, vocab));
         return tokens;
     }
     if (logits.get_element_type() == ov::element::bf16) {
@@ -369,6 +399,7 @@ int main(int argc, char* argv[]) try {
     dflash_cfg.rope_theta = draft_cfg.rope_theta;
     dflash_cfg.hidden_act = draft_cfg.hidden_act;
     dflash_cfg.attention_bias = draft_cfg.attention_bias;
+    dflash_cfg.target_layer_ids = draft_cfg.target_layer_ids;
 
     if (dflash_cfg.block_size <= 0) {
         dflash_cfg.block_size = 16;
@@ -377,8 +408,20 @@ int main(int argc, char* argv[]) try {
         throw std::runtime_error("block_size must be >= 2 for DFlash decoding");
     }
 
-    const auto target_layer_ids = ov::genai::modeling::models::build_target_layer_ids(
-        dflash_cfg.num_target_layers, dflash_cfg.num_hidden_layers);
+    // Use explicit target_layer_ids from config if available, else compute evenly-spaced
+    auto target_layer_ids = dflash_cfg.target_layer_ids.empty()
+        ? ov::genai::modeling::models::build_target_layer_ids(
+              dflash_cfg.num_target_layers, dflash_cfg.num_hidden_layers)
+        : dflash_cfg.target_layer_ids;
+    // Sync back so num_ctx_layers() uses the right count
+    dflash_cfg.target_layer_ids = target_layer_ids;
+    std::cout << "dflash_cfg.block_size is " << dflash_cfg.block_size << std::endl;
+    std::cout << "dflash_cfg.num_target_layers is " << dflash_cfg.num_target_layers << std::endl;
+    std::cout << "target_layer_ids: ";
+    for (auto id : target_layer_ids) {
+        std::cout << id << " ";
+    }
+    std::cout << std::endl;
 
     // Parse quantization config: CLI arg takes priority, then env vars
     auto parse_quant_mode = [](const std::string& s) -> ov::genai::modeling::weights::QuantizationConfig::Mode {
@@ -407,11 +450,12 @@ int main(int argc, char* argv[]) try {
     } else if (target_quant_arg.empty()) {
         target_quant_config = ov::genai::modeling::weights::parse_quantization_config_from_env();
     }
+    // Log target quantization config
     std::cout << "[quant] target: " << (target_quant_config.enabled() ? quant_mode_name(target_quant_config.mode) : "FP16");
     if (target_quant_config.enabled()) std::cout << ", group_size=" << target_quant_config.group_size;
     std::cout << std::endl;
 
-    // Draft quantization: CLI arg > FP16 (no env var fallback for draft)
+    // Draft quantization: CLI arg > FP16 (group_size follows target model default)
     ov::genai::modeling::weights::QuantizationConfig draft_quant_config;
     if (!draft_quant_arg.empty() && draft_quant_arg != "FP16") {
         draft_quant_config.mode = parse_quant_mode(draft_quant_arg);
@@ -429,9 +473,11 @@ int main(int argc, char* argv[]) try {
     // Build models inside a scope so that weight sources are freed after model building.
     // On iGPU (shared CPU/GPU memory), this recovers ~10+ GB of safetensors data.
     std::shared_ptr<ov::Model> target_model;
+    std::shared_ptr<ov::Model> context_fc_model;
     std::shared_ptr<ov::Model> combined_draft_model;
     std::shared_ptr<ov::Model> vision_model;
     ov::Tensor vl_pos_embed_weight;  // Extracted in scope for VL preprocessing later
+
     {
         auto target_data = ov::genai::safetensors::load_safetensors(target_dir);
         ov::genai::safetensors::SafetensorsWeightSource target_source(std::move(target_data));
@@ -460,20 +506,66 @@ int main(int argc, char* argv[]) try {
             vl_pos_embed_weight = target_source.get_tensor(pos_embed_name);
         }
 
-        // Build combined draft model (embed + draft layers + lm_head in single graph)
-        std::cout << "[Building combined draft model (embed+draft+lm_head)...]" << std::endl;
-        combined_draft_model = ov::genai::modeling::models::create_qwen3_5_dflash_combined_draft_model(
+        // Build context_fc model (fc + hidden_norm only — for incremental context_hidden caching)
+        std::cout << "[Building context_fc model (fc+hidden_norm)...]" << std::endl;
+        context_fc_model = ov::genai::modeling::models::create_qwen3_5_dflash_context_fc_model(
+            dflash_cfg, draft_source, draft_finalizer);
+
+        // V2 path: combined draft model with context_hidden
+        std::cout << "[Building combined draft model V2 (embed+draft+lm_head, cached context)...]" << std::endl;
+        combined_draft_model = ov::genai::modeling::models::create_qwen3_5_dflash_combined_draft_model_v2(
             target_qwen35_cfg, dflash_cfg, target_source, target_finalizer,
             draft_source, draft_finalizer);
     } // Weight sources (target_source, draft_source) and their safetensors data freed here.
+
+    // Apply f16 preprocessing for draft model's context_hidden input.
+    // context_hidden will be stored as f16 USM → GPU reads f16 directly, fewer reorder_data.
+    bool use_f16_ctx = false;
+    if (combined_draft_model) {
+        try {
+            ov::preprocess::PrePostProcessor ppp(combined_draft_model);
+            ppp.input("context_hidden").tensor().set_element_type(ov::element::f16);
+            ppp.input("context_hidden").preprocess().convert_element_type(ov::element::f32);
+            combined_draft_model = ppp.build();
+            use_f16_ctx = true;
+            std::cout << "[Draft model: context_hidden input set to f16 via preprocessing]" << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "[Warning] Failed to apply f16 draft preprocessing: " << e.what() << std::endl;
+        }
+    }
 
     // Compile models
     ov::Core core;
     ov::AnyMap compile_cfg = {
         {ov::hint::inference_precision.name(), ov::element::f16},
         {ov::hint::kv_cache_precision.name(), ov::element::f16},
-        //{ov::hint::activations_scale_factor.name(), 8.0f}
+        {ov::hint::performance_mode.name(), ov::hint::PerformanceMode::LATENCY},
     };
+    // dynamic_quantization_group_size=128: align activation quant groups with INT4 weight
+    // groups for optimal oneDNN GEMM performance on Xe2+/Xe3 iGPU.
+    compile_cfg[ov::hint::dynamic_quantization_group_size.name()] = uint64_t{128};
+    // GPU: share kernel programs across implementations to reduce memory (helps iGPU bandwidth)
+    compile_cfg[ov::intel_gpu::hint::enable_kernels_reuse.name()] = true;
+
+    std::cout << "[compile_cfg] ";
+    for (const auto& kv : compile_cfg) {
+        std::cout << kv.first << "=";
+        if (kv.second.is<ov::element::Type>()) {
+            std::cout << kv.second.as<ov::element::Type>().get_type_name();
+        } else if (kv.second.is<float>()) {
+            std::cout << kv.second.as<float>();
+        } else if (kv.second.is<bool>()) {
+            std::cout << (kv.second.as<bool>() ? "true" : "false");
+        } else if (kv.second.is<ov::hint::PerformanceMode>()) {
+            auto mode = kv.second.as<ov::hint::PerformanceMode>();
+            std::cout << (mode == ov::hint::PerformanceMode::LATENCY ? "LATENCY" :
+                         mode == ov::hint::PerformanceMode::THROUGHPUT ? "THROUGHPUT" : "other");
+        } else {
+            std::cout << "(unknown)";
+        }
+        std::cout << " ";
+    }
+    std::cout << std::endl;
 
     // Tokenizer
     ov::genai::Tokenizer tokenizer(target_dir);
@@ -589,19 +681,51 @@ int main(int argc, char* argv[]) try {
 
     // Compile
     std::cout << "[Compiling models on " << device << "...]" << std::endl;
+    // Set snapshot outputs to f16 to eliminate f16→f32 output reorders.
+    // GPU computes in f16 (INFERENCE_PRECISION_HINT=f16), so matching output dtype avoids
+    // per-step reorder_data kernel dispatch (48 reorders/step × ~766μs each = ~19% GPU time).
+    // Approach: Insert Convert(f16) before each snapshot Result node.
+    // NOTE: target_hidden stays f32 because CPU context_fc model requires f32 input.
+    {
+        int f16_outputs = 0;
+        for (auto& result : target_model->get_results()) {
+            for (auto& name : result->output(0).get_names()) {
+                if (name.find("snapshot.") == 0) {
+                    auto parent_output = result->input_value(0);
+                    if (parent_output.get_element_type() != ov::element::f16) {
+                        auto convert = std::make_shared<ov::op::v0::Convert>(parent_output, ov::element::f16);
+                        result->input(0).replace_source_output(convert->output(0));
+                        ++f16_outputs;
+                    }
+                    break;
+                }
+            }
+        }
+        if (f16_outputs > 0) {
+            target_model->validate_nodes_and_infer_types();
+            std::cout << "[opt] Inserted " << f16_outputs << " f16 converts for snapshot outputs" << std::endl;
+        }
+    }
+
     std::cout << "[Compiling target model...]" << std::endl;
     auto compiled_target = core.compile_model(target_model, device, compile_cfg);
-    std::cout << "[Compiling combined draft model (embed+draft+lm_head)...]" << std::endl;
+    std::cout << "[Compiling context_fc model (fc+hidden_norm) on CPU...]" << std::endl;
+    auto compiled_context_fc = core.compile_model(context_fc_model, "CPU", {});
+
+    // Compile draft model
+    std::cout << "[Compiling combined draft model V2 (cached context)...]" << std::endl;
     auto compiled_draft = core.compile_model(combined_draft_model, device, compile_cfg);
-    std::cout << "[All 2 models compiled.]" << std::endl;
+    std::cout << "[All models compiled.]" << std::endl;
 
     auto target_request = compiled_target.create_infer_request();
+    auto context_fc_request = compiled_context_fc.create_infer_request();
     auto draft_request = compiled_draft.create_infer_request();
 
     // Release model graphs and weight data — no longer needed after compilation.
     // On iGPU (shared CPU/GPU memory), this recovers ~10+ GB that would otherwise
     // compete with GPU for memory bandwidth during decode.
     target_model.reset();
+    context_fc_model.reset();
     combined_draft_model.reset();
     if (vision_model) vision_model.reset();
 
@@ -639,40 +763,18 @@ int main(int argc, char* argv[]) try {
     }
 
     // Setup GPU-side snapshot tensors if running on GPU
+    // NOTE: With deferred_state_commit, the GPU plugin manages snapshot states internally
+    // via state_update_mode. We do NOT need to bind external cl_mem tensors for snapshot
+    // outputs — doing so triggers 5904 unnecessary clEnqueueWriteBuffer copies per inference
+    // (48 outputs × 123 steps × ~257μs each = 1.5s). Just skip the binding.
     bool gpu_snapshots = false;
-    std::map<std::string, ov::Tensor> snapshot_remote_tensors;
     ov::RemoteContext remote_context;
-    if (has_snapshots) {
-        try {
-            remote_context = compiled_target.get_context();
-            for (auto& output : compiled_target.outputs()) {
-                std::string snap_name;
-                for (auto& name : output.get_names()) {
-                    if (name.find("snapshot.") == 0) { snap_name = name; break; }
-                }
-                if (snap_name.empty()) continue;
-
-                auto pshape = output.get_partial_shape();
-                ov::Shape snap_shape;
-                snap_shape.push_back(1);
-                snap_shape.push_back(static_cast<size_t>(dflash_cfg.block_size));
-                for (size_t d = 2; d < pshape.size(); ++d)
-                    snap_shape.push_back(pshape[d].get_length());
-
-                auto dtype = output.get_element_type();
-                auto snap_remote = remote_context.create_tensor(dtype, snap_shape);
-                snapshot_remote_tensors[snap_name] = snap_remote;
-            }
-            gpu_snapshots = !snapshot_remote_tensors.empty();
-            if (gpu_snapshots) {
-                std::cout << "[Snapshots] GPU-side snapshot tensors allocated: "
-                          << snapshot_remote_tensors.size() << " outputs" << std::endl;
-            }
-        } catch (const std::exception& e) {
-            std::cout << "[Snapshots] GPU context not available, falling back to host: "
-                      << e.what() << std::endl;
-            gpu_snapshots = false;
-        }
+    bool has_gpu_context = false;
+    try {
+        remote_context = compiled_target.get_context();
+        has_gpu_context = true;
+    } catch (const std::exception&) {
+        has_gpu_context = false;
     }
 
     const bool use_deferred_state_commit = has_snapshots &&
@@ -686,12 +788,15 @@ int main(int argc, char* argv[]) try {
 
     int32_t pending_snapshot_commit_index = -1;
 
-    // Bind GPU RemoteTensors for snapshot outputs before prefill.
-    if (gpu_snapshots) {
-        for (auto& [snap_name, snap_remote] : snapshot_remote_tensors) {
-            target_request.set_tensor(snap_name, snap_remote);
-        }
-    }
+    std::cout << "[DFlash] has_state_update_mode_input=" << has_state_update_mode_input
+              << " has_snapshots=" << has_snapshots
+              << " gpu_snapshots=" << gpu_snapshots
+              << " use_deferred_state_commit=" << use_deferred_state_commit << std::endl;
+
+    std::cout << "---------------START INFERENCE --------------------" << std::endl;
+
+    // Snapshot remote tensors no longer bound — see note above.
+    // Deferred state commit still works via state_update_mode.
 
     target_request.get_tensor("attention_mask").set_shape({1, 0});
 
@@ -723,12 +828,57 @@ int main(int argc, char* argv[]) try {
     }
 
     target_kv_state.add_inputs(make_ids_tensor(output_ids));
-    ov::Tensor target_hidden_block = ensure_f32_copy(target_request.get_tensor("target_hidden"));
+    ov::Tensor target_hidden_block = copy_to_host(target_request.get_tensor("target_hidden"));
+    const auto hidden_elem_type = target_hidden_block.get_element_type();
+    const size_t hidden_elem_size = hidden_elem_type.size();
     const size_t hidden_dim = target_hidden_block.get_shape()[2];
-    ov::Tensor target_hidden_storage(ov::element::f32, {1, max_length + static_cast<size_t>(dflash_cfg.block_size), hidden_dim});
+    const size_t hidden_storage_elems = (max_length + static_cast<size_t>(dflash_cfg.block_size)) * hidden_dim;
+    // Allocate hidden state storage: prefer USM host tensor (zero-copy on iGPU) over regular CPU tensor
+    ov::Tensor target_hidden_storage;
+    bool using_usm_storage = false;
+    if (has_gpu_context) {
+        try {
+            target_hidden_storage = remote_context.create_host_tensor(
+                hidden_elem_type, {1, max_length + static_cast<size_t>(dflash_cfg.block_size), hidden_dim});
+            using_usm_storage = true;
+        } catch (const std::exception&) {
+            using_usm_storage = false;
+        }
+    }
+    if (!using_usm_storage) {
+        target_hidden_storage = ov::Tensor(hidden_elem_type, {1, max_length + static_cast<size_t>(dflash_cfg.block_size), hidden_dim});
+    }
+    std::cerr << "[DFlash] target_hidden_storage: [1," << (max_length + dflash_cfg.block_size)
+              << "," << hidden_dim << "] = "
+              << (hidden_storage_elems * hidden_elem_size / 1024 / 1024) << " MB ("
+              << hidden_elem_type << (using_usm_storage ? " USM host" : " CPU") << ")" << std::endl;
     ov::Tensor target_hidden_init(target_hidden_storage, {0, 0, 0}, {1, prompt_len, hidden_dim});
     target_hidden_block.copy_to(target_hidden_init);
     size_t target_hidden_len = prompt_len;
+
+    // Pre-allocate USM tensor for target_hidden output to avoid GPU→CPU copy each decode step.
+    // After set_tensor, the GPU writes directly to USM (CPU-readable on iGPU).
+    bool using_usm_output = false;
+    if (using_usm_storage) {
+        try {
+            const size_t max_verify_tokens = std::max(prompt_len,
+                static_cast<size_t>(dflash_cfg.block_size) + 1);
+            auto target_hidden_output_usm = remote_context.create_host_tensor(
+                hidden_elem_type, {1, max_verify_tokens, hidden_dim});
+            target_request.set_tensor("target_hidden", target_hidden_output_usm);
+            using_usm_output = true;
+            std::cerr << "[DFlash] target_hidden output bound to USM host tensor" << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "[DFlash] USM output binding failed: " << e.what() << std::endl;
+        }
+    }
+
+    // Helper: get target_hidden as CPU-readable tensor (zero-copy if USM, else GPU→CPU copy)
+    auto get_target_hidden = [&]() -> ov::Tensor {
+        auto t = target_request.get_tensor("target_hidden");
+        if (using_usm_output) return t;
+        return copy_to_host(t);
+    };
 
     int64_t next_token = argmax_last_token(logits);
     auto prefill_end = Clock::now();
@@ -742,7 +892,108 @@ int main(int argc, char* argv[]) try {
     const double prefill_ms = duration_ms(prefill_start, prefill_end);
     perf.prefill_wall.add(prefill_ms);
 
+    // ── Context hidden cache for draft model V2 ──
+    // Pre-compute context_hidden = hidden_norm(fc(target_hidden)) and cache it.
+    // Each draft step reuses the cache instead of recomputing fc on the full context.
+    const size_t ctx_hidden_dim = static_cast<size_t>(dflash_cfg.hidden_size);
+    const size_t max_ctx_len = max_length + static_cast<size_t>(dflash_cfg.block_size);
+    const ov::element::Type ctx_elem = use_f16_ctx ? ov::element::f16 : ov::element::f32;
+    const size_t ctx_elem_size = use_f16_ctx ? sizeof(ov::float16) : sizeof(float);
+    // Allocate cache as USM host tensor (zero-copy read by GPU draft model)
+    ov::Tensor ctx_hidden_storage;
+    bool using_usm_ctx = false;
+    if (has_gpu_context) {
+        try {
+            ctx_hidden_storage = remote_context.create_host_tensor(
+                ctx_elem, {1, max_ctx_len, ctx_hidden_dim});
+            using_usm_ctx = true;
+        } catch (const std::exception&) {
+            using_usm_ctx = false;
+        }
+    }
+    if (!using_usm_ctx) {
+        ctx_hidden_storage = ov::Tensor(ctx_elem, {1, max_ctx_len, ctx_hidden_dim});
+    }
+
+    // Helper: copy f32 context_fc output to cache (f32 or f16 depending on use_f16_ctx)
+    auto copy_ctx_to_cache = [&](const ov::Tensor& src, ov::Tensor& dst) {
+        if (use_f16_ctx) {
+            const float* s = src.data<float>();
+            ov::float16* d = dst.data<ov::float16>();
+            const size_t n = src.get_size();
+            for (size_t i = 0; i < n; ++i)
+                d[i] = ov::float16(s[i]);
+        } else {
+            src.copy_to(dst);
+        }
+    };
+
+    // Compute initial context_hidden from prefill target_hidden
+    {
+        ov::Tensor initial_th(target_hidden_storage, {0, 0, 0}, {1, prompt_len, hidden_dim});
+        context_fc_request.set_tensor("target_hidden", initial_th);
+        context_fc_request.infer();
+        auto init_ctx = context_fc_request.get_tensor("context_hidden");
+        ov::Tensor dst_init(ctx_hidden_storage, {0, 0, 0}, {1, prompt_len, ctx_hidden_dim});
+        copy_ctx_to_cache(init_ctx, dst_init);
+    }
+    size_t context_hidden_len = prompt_len;
+    std::cerr << "[DFlash] context_hidden cache: [1," << max_ctx_len
+              << "," << ctx_hidden_dim << "] = "
+              << (max_ctx_len * ctx_hidden_dim * ctx_elem_size / 1024 / 1024) << " MB ("
+              << ctx_elem.get_type_name()
+              << (using_usm_ctx ? " USM host" : " CPU") << ")" << std::endl;
+    std::cerr << "[DFlash] initial context_hidden computed for " << prompt_len << " tokens" << std::endl;
+
     std::cout << "\n[Generating...]" << std::flush;
+
+    const size_t block_size = static_cast<size_t>(dflash_cfg.block_size);
+
+    // Pre-allocate reusable tensors for draft and verify steps.
+    // Allocate at max sizes and reuse via set_shape() to avoid per-step allocation.
+    ov::Tensor draft_block_ids_tensor(ov::element::i64, {1, static_cast<size_t>(block_size)});
+    // Draft position_ids: max size = max_ctx_len + block_size (V2 path)
+    ov::Tensor reuse_draft_pos(ov::element::i64, {1, max_ctx_len + block_size});
+    // Verify input_ids: always block_size tokens
+    ov::Tensor reuse_verify_ids(ov::element::i64, {1, block_size});
+    // Verify attention_mask: all-ones, grows up to max_length + block_size
+    ov::Tensor reuse_verify_mask(ov::element::i64, {1, max_length + block_size});
+    std::fill_n(reuse_verify_mask.data<int64_t>(),
+                static_cast<ptrdiff_t>(max_length + block_size), 1LL);
+    // Verify position_ids (mRoPE): [3, 1, block_size]
+    ov::Tensor reuse_verify_pos(ov::element::i64, {3, 1, block_size});
+    // Reusable block_output_ids vector (avoid per-step heap allocation)
+    std::vector<int64_t> block_output_ids;
+    block_output_ids.reserve(block_size);
+
+    // ── Pre-bind logits output to USM host tensors (eliminates HtoH copy in wait()) ──
+    // The GPU plugin detects USM host memory and writes directly to it, skipping the
+    // intermediate device→host copy. Saves ~500μs per infer() call.
+    const auto logits_elem_type = logits.get_element_type();
+    const size_t vocab_size = logits.get_shape().back();
+    bool using_usm_draft_logits = false;
+    bool using_usm_target_logits = false;
+    if (has_gpu_context) {
+        try {
+            auto draft_logits_usm = remote_context.create_host_tensor(
+                logits_elem_type, {1, block_size, vocab_size});
+            draft_request.set_tensor("logits", draft_logits_usm);
+            using_usm_draft_logits = true;
+        } catch (const std::exception&) {}
+    }
+    if (has_gpu_context) {
+        try {
+            auto target_logits_usm = remote_context.create_host_tensor(
+                logits_elem_type, {1, block_size + 1, vocab_size});
+            target_request.set_tensor("logits", target_logits_usm);
+            using_usm_target_logits = true;
+        } catch (const std::exception&) {}
+    }
+    if (using_usm_draft_logits || using_usm_target_logits) {
+        std::cerr << "[DFlash] USM logits bound: draft=" << using_usm_draft_logits
+                  << " target=" << using_usm_target_logits
+                  << " (" << logits_elem_type << " vocab=" << vocab_size << ")" << std::endl;
+    }
 
     const auto generation_start = Clock::now();
 
@@ -757,33 +1008,74 @@ int main(int argc, char* argv[]) try {
         double step_tracked_ms = 0.0;
 
         // Build draft block inputs: [last_token, MASK, MASK, ...]
-        std::vector<int64_t> block_ids(static_cast<size_t>(dflash_cfg.block_size), mask_token_id);
-        block_ids[0] = output_ids.back();
+        {
+            auto* ids = draft_block_ids_tensor.data<int64_t>();
+            ids[0] = output_ids.back();
+            for (size_t i = 1; i < block_size; ++i)
+                ids[i] = mask_token_id;
+        }
+
+        // Pre-prepare target verify tensors BEFORE draft inference.
+        // verify_len is always block_size (known ahead of time), so we can
+        // set up attention_mask, position_ids, beam_idx, state_update_mode
+        // while the GPU is busy with draft model.
+        const size_t pre_verify_len = block_size;
+        {
+            reuse_verify_ids.set_shape({1, pre_verify_len});
+            // input_ids[0] = last accepted token (known now)
+            reuse_verify_ids.data<int64_t>()[0] = output_ids.back();
+            // Remaining slots filled after draft argmax
+
+            reuse_verify_mask.set_shape({1, target_hidden_len + pre_verify_len});
+            target_request.set_tensor("attention_mask", reuse_verify_mask);
+
+            reuse_verify_pos.set_shape({3, 1, pre_verify_len});
+            auto* pd = reuse_verify_pos.data<int64_t>();
+            for (size_t dim = 0; dim < 3; ++dim)
+                for (size_t i = 0; i < pre_verify_len; ++i)
+                    pd[dim * pre_verify_len + i] = static_cast<int64_t>(target_hidden_len + i);
+            target_request.set_tensor("position_ids", reuse_verify_pos);
+            target_request.set_tensor("beam_idx", beam_idx);
+            if (vl_mode) {
+                target_request.set_tensor("visual_embeds", zero_visual_embeds);
+                target_request.set_tensor("visual_pos_mask", zero_visual_pos_mask);
+            }
+
+            if (use_deferred_state_commit && pending_snapshot_commit_index >= 0) {
+                set_target_state_update_mode(-(pending_snapshot_commit_index + 1));
+                pending_snapshot_commit_index = -1;
+            } else if (use_deferred_state_commit) {
+                set_target_state_update_mode(0);
+            } else {
+                set_target_state_update_mode(1);
+            }
+        }
 
         auto draft_start = Clock::now();
 
-        // Draft position_ids (2D): [0..T-1, T-1..T+B-2] — context + draft with overlap
-        const size_t total_pos = target_hidden_len + block_ids.size();
-        ov::Tensor draft_pos(ov::element::i64, {1, total_pos});
+        ov::Tensor draft_logits;
         {
-            auto* pd = draft_pos.data<int64_t>();
-            for (size_t i = 0; i < target_hidden_len; ++i)
-                pd[i] = static_cast<int64_t>(i);
-            for (size_t i = target_hidden_len; i < total_pos; ++i)
-                pd[i] = static_cast<int64_t>(target_hidden_len - 1 + (i - target_hidden_len));
+            ov::Tensor ctx_for_draft(ctx_hidden_storage,
+                                     {0, 0, 0},
+                                     {1, context_hidden_len, ctx_hidden_dim});
+
+            const size_t total_pos = context_hidden_len + block_size;
+            reuse_draft_pos.set_shape({1, total_pos});
+            {
+                auto* pd = reuse_draft_pos.data<int64_t>();
+                for (size_t i = 0; i < total_pos; ++i)
+                    pd[i] = static_cast<int64_t>(i);
+            }
+
+            draft_request.set_tensor("context_hidden", ctx_for_draft);
+            draft_request.set_tensor("input_ids", draft_block_ids_tensor);
+            draft_request.set_tensor("position_ids", reuse_draft_pos);
+            draft_request.infer();
+            draft_logits = draft_request.get_tensor("logits");
         }
 
-        // Run combined draft model (embed + draft + lm_head in one GPU dispatch)
-        ov::Tensor hidden_view(target_hidden_storage, {0, 0, 0}, {1, target_hidden_len, hidden_dim});
-        draft_request.set_tensor("target_hidden", hidden_view);
-        draft_request.set_tensor("input_ids", make_ids_tensor(block_ids));
-        draft_request.set_tensor("position_ids", draft_pos);
-        draft_request.infer();
-
-        auto draft_logits = draft_request.get_tensor("logits");
-
         // Argmax draft tokens (skip position 0 which is the last accepted token)
-        const size_t draft_len = block_ids.size() - 1;
+        const size_t draft_len = block_size - 1;
         auto draft_tokens = argmax_logits_slice(draft_logits, 1, draft_len);
 
         auto draft_end = Clock::now();
@@ -791,9 +1083,8 @@ int main(int argc, char* argv[]) try {
         perf.draft_wall.add(draft_ms);
         step_tracked_ms += draft_ms;
 
-        // Batch verification: construct block_output_ids
-        std::vector<int64_t> block_output_ids;
-        block_output_ids.reserve(block_ids.size());
+        // Batch verification: construct block_output_ids (reuse pre-allocated vector)
+        block_output_ids.clear();
         block_output_ids.push_back(output_ids.back());  // Last accepted token
         block_output_ids.insert(block_output_ids.end(), draft_tokens.begin(), draft_tokens.end());
 
@@ -805,25 +1096,12 @@ int main(int argc, char* argv[]) try {
             saved_linear = save_linear_states(target_request);
         }
 
-        // Verify
+        // Verify — most tensors already set during pre-prepare above.
+        // Only need to fill in the actual draft token IDs.
         auto verify_start = Clock::now();
-        target_request.set_tensor("input_ids", make_ids_tensor(block_output_ids));
-        target_request.set_tensor("attention_mask", make_attention_mask(target_hidden_len + verify_len));
-        target_request.set_tensor("position_ids", make_mrope_position_ids(target_hidden_len, verify_len));
-        target_request.set_tensor("beam_idx", beam_idx);
-        if (vl_mode) {
-            target_request.set_tensor("visual_embeds", zero_visual_embeds);
-            target_request.set_tensor("visual_pos_mask", zero_visual_pos_mask);
-        }
-
-        if (use_deferred_state_commit && pending_snapshot_commit_index >= 0) {
-            set_target_state_update_mode(-(pending_snapshot_commit_index + 1));
-            pending_snapshot_commit_index = -1;
-        } else if (use_deferred_state_commit) {
-            set_target_state_update_mode(0);
-        } else {
-            set_target_state_update_mode(1);
-        }
+        std::memcpy(reuse_verify_ids.data<int64_t>(), block_output_ids.data(),
+                     verify_len * sizeof(int64_t));
+        target_request.set_tensor("input_ids", reuse_verify_ids);
 
         target_request.infer();
         auto verify_end = Clock::now();
@@ -832,19 +1110,49 @@ int main(int argc, char* argv[]) try {
         step_tracked_ms += verify_ms;
 
         logits = target_request.get_tensor("logits");
-        auto posterior_tokens = argmax_logits_slice(logits, 0, verify_len);
 
-        // Find acceptance length
+        // Lazy argmax: compute one row at a time, stop at first draft mismatch.
+        // Saves work when early rejection occurs (avg acceptance ~3.3 out of 15).
+        const auto logits_shape = logits.get_shape();
+        const size_t vocab = logits_shape[2];
         size_t accepted = 0;
-        for (size_t i = 0; i < draft_tokens.size(); ++i) {
-            if (draft_tokens[i] == posterior_tokens[i]) {
+        int64_t posterior_next = 0;
+
+        if (logits.get_element_type() == ov::element::f16) {
+            const auto* ldata = reinterpret_cast<const uint16_t*>(logits.data<const ov::float16>());
+            for (size_t i = 0; i < draft_tokens.size(); ++i) {
+                int64_t tok = argmax_row_f16_fast(ldata + i * vocab, vocab);
+                if (tok != draft_tokens[i]) {
+                    posterior_next = tok;
+                    break;
+                }
                 ++accepted;
-            } else {
-                break;
             }
+            if (accepted == draft_tokens.size()) {
+                posterior_next = argmax_row_f16_fast(ldata + accepted * vocab, vocab);
+            }
+        } else if (logits.get_element_type() == ov::element::f32) {
+            const auto* ldata = logits.data<const float>();
+            for (size_t i = 0; i < draft_tokens.size(); ++i) {
+                int64_t tok = argmax_row(ldata + i * vocab, vocab);
+                if (tok != draft_tokens[i]) {
+                    posterior_next = tok;
+                    break;
+                }
+                ++accepted;
+            }
+            if (accepted == draft_tokens.size()) {
+                posterior_next = argmax_row(ldata + accepted * vocab, vocab);
+            }
+        } else {
+            auto posterior_tokens = argmax_logits_slice(logits, 0, verify_len);
+            for (size_t i = 0; i < draft_tokens.size(); ++i) {
+                if (draft_tokens[i] == posterior_tokens[i]) ++accepted;
+                else break;
+            }
+            posterior_next = posterior_tokens[accepted];
         }
 
-        int64_t posterior_next = posterior_tokens[accepted];
         const size_t num_accepted = accepted + 1;
 
         // Multi-path acceptance handling (matching dflash_strategy)
@@ -864,15 +1172,15 @@ int main(int argc, char* argv[]) try {
             ov::genai::utils::trim_kv_cache(target_request, target_kv_state, std::nullopt);
             target_kv_state.num_tokens_to_trim = 0;
 
-            target_hidden_block = ensure_f32_copy(target_request.get_tensor("target_hidden"));
+            target_hidden_block = get_target_hidden();
         } else if (all_accepted) {
-            target_hidden_block = ensure_f32_copy(target_request.get_tensor("target_hidden"));
+            target_hidden_block = get_target_hidden();
         } else if (!has_linear_states) {
             const size_t tokens_to_trim = verify_len - num_accepted;
             target_kv_state.num_tokens_to_trim = tokens_to_trim;
             ov::genai::utils::trim_kv_cache(target_request, target_kv_state, std::nullopt);
             target_kv_state.num_tokens_to_trim = 0;
-            target_hidden_block = ensure_f32_copy(target_request.get_tensor("target_hidden"));
+            target_hidden_block = get_target_hidden();
         } else {
             restore_linear_states(target_request, saved_linear);
 
@@ -881,11 +1189,22 @@ int main(int argc, char* argv[]) try {
             target_kv_state.num_tokens_to_trim = 0;
 
             {
-                std::vector<int64_t> accepted_block(block_output_ids.begin(),
-                                                    block_output_ids.begin() + static_cast<ptrdiff_t>(num_accepted));
-                target_request.set_tensor("input_ids", make_ids_tensor(accepted_block));
-                target_request.set_tensor("attention_mask", make_attention_mask(target_hidden_len + num_accepted));
-                target_request.set_tensor("position_ids", make_mrope_position_ids(target_hidden_len, num_accepted));
+                reuse_verify_ids.set_shape({1, num_accepted});
+                std::memcpy(reuse_verify_ids.data<int64_t>(), block_output_ids.data(),
+                             num_accepted * sizeof(int64_t));
+                target_request.set_tensor("input_ids", reuse_verify_ids);
+
+                reuse_verify_mask.set_shape({1, target_hidden_len + num_accepted});
+                target_request.set_tensor("attention_mask", reuse_verify_mask);
+
+                {
+                    reuse_verify_pos.set_shape({3, 1, num_accepted});
+                    auto* pd = reuse_verify_pos.data<int64_t>();
+                    for (size_t dim = 0; dim < 3; ++dim)
+                        for (size_t i = 0; i < num_accepted; ++i)
+                            pd[dim * num_accepted + i] = static_cast<int64_t>(target_hidden_len + i);
+                }
+                target_request.set_tensor("position_ids", reuse_verify_pos);
                 target_request.set_tensor("beam_idx", beam_idx);
                 if (vl_mode) {
                     target_request.set_tensor("visual_embeds", zero_visual_embeds);
@@ -895,7 +1214,7 @@ int main(int argc, char* argv[]) try {
                 target_request.infer();
             }
 
-            target_hidden_block = ensure_f32_copy(target_request.get_tensor("target_hidden"));
+            target_hidden_block = get_target_hidden();
         }
 
         if (num_accepted > 0 && target_hidden_len + num_accepted <= max_length + static_cast<size_t>(dflash_cfg.block_size)) {
@@ -903,7 +1222,17 @@ int main(int argc, char* argv[]) try {
             ov::Tensor dst_slice(target_hidden_storage,
                                  {0, target_hidden_len, 0},
                                  {1, target_hidden_len + num_accepted, hidden_dim});
-            src_slice.copy_to(dst_slice);
+            // Direct CPU memcpy — both tensors are USM host (f32), avoids GPU-enqueued memcpy overhead
+            std::memcpy(dst_slice.data<float>(), src_slice.data<const float>(),
+                        num_accepted * hidden_dim * sizeof(float));
+
+            // Launch context_fc async — overlaps GPU work with CPU postprocessing below
+            ov::Tensor new_th(target_hidden_storage,
+                              {0, target_hidden_len, 0},
+                              {1, target_hidden_len + num_accepted, hidden_dim});
+            context_fc_request.set_tensor("target_hidden", new_th);
+            context_fc_request.start_async();
+
             target_hidden_len += num_accepted;
         }
 
@@ -917,20 +1246,18 @@ int main(int argc, char* argv[]) try {
         ++perf.draft_steps;
         perf.accepted_tokens += accepted;  // raw acceptance (before max_length clipping, matches pipeline)
         perf.accepted_per_step.push_back(accepted);
-        {
-            std::vector<int64_t> step_toks;
-            for (size_t i = 0; i < accepted; ++i)
-                step_toks.push_back(draft_tokens[i]);
-            step_toks.push_back(posterior_next);
-            auto text = tokenizer.decode(step_toks, {ov::genai::skip_special_tokens(true)});
-            std::cout << "[Step " << perf.draft_steps << "] accepted=" << accepted
-                      << " ids=[";
-            for (size_t i = 0; i < step_toks.size(); ++i) {
-                if (i) std::cout << ",";
-                std::cout << step_toks[i];
-            }
-            std::cout << "] [" << text << "]" << std::endl;
+
+        // Wait for context_fc to finish (should have completed during postprocessing above)
+        if (num_accepted > 0) {
+            context_fc_request.wait();
+            auto new_ctx = context_fc_request.get_tensor("context_hidden");
+            ov::Tensor ctx_dst(ctx_hidden_storage,
+                               {0, context_hidden_len, 0},
+                               {1, context_hidden_len + num_accepted, ctx_hidden_dim});
+            copy_ctx_to_cache(new_ctx, ctx_dst);
+            context_hidden_len += num_accepted;
         }
+
         auto postproc_end = Clock::now();
         perf.postproc_wall.add(duration_ms(postproc_start, postproc_end));
 
