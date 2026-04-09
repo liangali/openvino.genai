@@ -403,6 +403,26 @@ std::shared_ptr<ov::Model> create_qwen3_5_dflash_step_model(
     ov::genai::modeling::weights::WeightSource& draft_source,
     ov::genai::modeling::weights::WeightFinalizer& draft_finalizer);
 
+/// Context FC model — computes fc + hidden_norm only from target_hidden.
+/// Runs once per verify cycle on newly accepted tokens to update cached context_hidden.
+/// Input:  target_hidden [1, A, ctx_dim]
+/// Output: context_hidden [1, A, hidden_size]
+std::shared_ptr<ov::Model> create_qwen3_5_dflash_context_fc_model(
+    const DFlashDraftConfig& draft_cfg,
+    ov::genai::modeling::weights::WeightSource& draft_source,
+    ov::genai::modeling::weights::WeightFinalizer& draft_finalizer);
+
+/// Combined draft model V2 — takes pre-computed context_hidden (skips fc+hidden_norm).
+/// Input:  context_hidden [1, T, hidden_size], input_ids [1, B], position_ids [1, T+B]
+/// Output: logits [1, B, vocab_size]
+std::shared_ptr<ov::Model> create_qwen3_5_dflash_combined_draft_model_v2(
+    const Qwen3_5Config& qwen_cfg,
+    const DFlashDraftConfig& draft_cfg,
+    ov::genai::modeling::weights::WeightSource& target_source,
+    ov::genai::modeling::weights::WeightFinalizer& target_finalizer,
+    ov::genai::modeling::weights::WeightSource& draft_source,
+    ov::genai::modeling::weights::WeightFinalizer& draft_finalizer);
+
 }  // namespace models
 }  // namespace modeling
 }  // namespace genai

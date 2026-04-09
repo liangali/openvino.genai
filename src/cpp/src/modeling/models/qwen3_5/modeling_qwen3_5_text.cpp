@@ -483,8 +483,8 @@ Tensor Qwen3_5GatedDeltaNet::forward(const Tensor& hidden_states,
     auto b = projected_b;
     auto a = projected_a;
 
-    auto mixed_qkv = projected_qkv.permute({0, 2, 1});
-
+    // FusedConv accepts [B, S, D] directly (channel-last / BSC format).
+    // No permute needed for the fused path; fallback still needs [B, C, S].
     auto batch = shape::dim(masked_hidden, 0);
     auto conv_shape = shape::make({batch,
                                    ops::const_vec(op_ctx, std::vector<int64_t>{static_cast<int64_t>(conv_dim_)}),
@@ -500,22 +500,24 @@ Tensor Qwen3_5GatedDeltaNet::forward(const Tensor& hidden_states,
     Tensor mixed_after_conv;
     if (use_fused_conv_op()) {
         // ── FusedConv op path: fuses Gather + Concat + GroupConv + SiLU + Slice ──
+        // Input is projected_qkv [B, S, D] — no permute needed (BSC kernel).
         auto conv_w_2d = conv1d_weight().reshape({conv_dim_, conv_kernel_size_}, false);
 
         if (g_snapshot_accumulator.active) {
             auto [conv_out, conv_state, conv_snap] = ops::fused_conv_with_snapshots(
-                mixed_qkv, conv_w_2d, beam_idx, conv_init, conv_var, state_update_mode_tensor,
+                projected_qkv, conv_w_2d, beam_idx, conv_init, conv_var, state_update_mode_tensor,
                 g_snapshot_accumulator.snapshot_max_seq);
             mixed_after_conv = conv_out;
             g_snapshot_accumulator.entries.push_back(
                 {"snapshot." + conv_info.variable_id, conv_snap.output()});
         } else {
             auto fused_result = ops::fused_conv(
-                mixed_qkv, conv_w_2d, beam_idx, conv_init, conv_var, state_update_mode_tensor);
+                projected_qkv, conv_w_2d, beam_idx, conv_init, conv_var, state_update_mode_tensor);
             mixed_after_conv = fused_result.first;
         }
     } else {
-        // ── Fallback: original decomposed path ──
+        // ── Fallback: original decomposed path (expects [B, C, S]) ──
+        auto mixed_qkv = projected_qkv.permute({0, 2, 1});
         auto conv_read = std::make_shared<ov::op::v6::ReadValue>(conv_init.output(), conv_var);
         auto conv_cached = ops::gather(Tensor(conv_read->output(0), op_ctx), beam_idx, 0);
 
@@ -523,9 +525,11 @@ Tensor Qwen3_5GatedDeltaNet::forward(const Tensor& hidden_states,
         mixed_after_conv = apply_depthwise_causal_conv(mixed_qkv, conv_cached, &next_conv_state);
         auto conv_assign = std::make_shared<ov::opset13::Assign>(next_conv_state.output(), conv_var);
         ctx().register_sink(conv_assign);
+        // Permute output back to [B, S, D]
+        mixed_after_conv = mixed_after_conv.permute({0, 2, 1});
     }
 
-    auto mixed_bt = mixed_after_conv.permute({0, 2, 1});
+    auto mixed_bt = mixed_after_conv;
     auto q_conv = ops::slice(mixed_bt, 0, key_dim_, 1, 2);
     auto k_conv = ops::slice(mixed_bt, key_dim_, key_dim_ * 2, 1, 2);
     auto v_conv = ops::slice(mixed_bt, key_dim_ * 2, key_dim_ * 2 + value_dim_, 1, 2);
@@ -1449,7 +1453,7 @@ std::shared_ptr<ov::Model> create_qwen3_5_dflash_combined_draft_model(
     // ── Inputs ──
     const ov::element::Type dtype = ov::element::f32;
     const int64_t ctx_dim = static_cast<int64_t>(draft_cfg.hidden_size) *
-                            static_cast<int64_t>(draft_cfg.num_hidden_layers);
+                            static_cast<int64_t>(draft_cfg.num_ctx_layers());
     auto target_hidden = ctx.parameter("target_hidden", dtype, ov::PartialShape{-1, -1, ctx_dim});
     auto input_ids = ctx.parameter("input_ids", ov::element::i64, ov::PartialShape{-1, -1});
     auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
@@ -1484,7 +1488,7 @@ std::shared_ptr<ov::Model> create_qwen3_5_dflash_context_kv_model(
 
     const ov::element::Type dtype = ov::element::f32;
     const int64_t ctx_dim = static_cast<int64_t>(draft_cfg.hidden_size) *
-                            static_cast<int64_t>(draft_cfg.num_hidden_layers);
+                            static_cast<int64_t>(draft_cfg.num_ctx_layers());
     auto target_hidden = ctx.parameter("target_hidden", dtype, ov::PartialShape{-1, -1, ctx_dim});
     auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
 
@@ -1585,6 +1589,106 @@ std::shared_ptr<ov::Model> create_qwen3_5_dflash_step_model(
     auto draft_hidden = draft_model.forward_with_cached_kv(noise_embedding, position_ids, context_kv);
     auto logits = head.forward(draft_hidden);
 
+    auto logits_result = std::make_shared<ov::op::v0::Result>(logits.output());
+    set_name(logits_result, "logits");
+
+    return ctx.build_model({logits_result->output(0)});
+}
+
+// ============================================================================
+// DFlash Context FC Model — computes fc + hidden_norm only
+// ============================================================================
+// Runs on new target_hidden tokens to produce context_hidden for caching.
+// Input:  target_hidden [1, A, ctx_dim]
+// Output: context_hidden [1, A, hidden_size]
+std::shared_ptr<ov::Model> create_qwen3_5_dflash_context_fc_model(
+    const DFlashDraftConfig& draft_cfg,
+    ov::genai::modeling::weights::WeightSource& draft_source,
+    ov::genai::modeling::weights::WeightFinalizer& draft_finalizer) {
+    BuilderContext ctx;
+
+    DFlashDraftModel draft_model(ctx, draft_cfg);
+    ov::genai::modeling::weights::load_model(draft_model, draft_source, draft_finalizer);
+
+    const ov::element::Type dtype = ov::element::f32;
+    const int64_t ctx_dim = static_cast<int64_t>(draft_cfg.hidden_size) *
+                            static_cast<int64_t>(draft_cfg.num_ctx_layers());
+    auto target_hidden = ctx.parameter("target_hidden", dtype, ov::PartialShape{-1, -1, ctx_dim});
+
+    auto context_hidden = draft_model.compute_context_hidden(target_hidden);
+
+    auto result = std::make_shared<ov::op::v0::Result>(context_hidden.output());
+    set_name(result, "context_hidden");
+
+    return ctx.build_model({result->output(0)});
+}
+
+// ============================================================================
+// DFlash Combined Draft Model V2 — takes pre-computed context_hidden
+// ============================================================================
+// Skips fc + hidden_norm (cached externally). Same as combined_draft but with
+// context_hidden [1, T, hidden_size] input instead of target_hidden [1, T, ctx_dim].
+std::shared_ptr<ov::Model> create_qwen3_5_dflash_combined_draft_model_v2(
+    const Qwen3_5Config& qwen_cfg,
+    const DFlashDraftConfig& draft_cfg,
+    ov::genai::modeling::weights::WeightSource& target_source,
+    ov::genai::modeling::weights::WeightFinalizer& target_finalizer,
+    ov::genai::modeling::weights::WeightSource& draft_source,
+    ov::genai::modeling::weights::WeightFinalizer& draft_finalizer) {
+    BuilderContext ctx;
+
+    // ── Embedding path (target weights under "model" prefix) ──
+    Module embed_root("model", ctx);
+    VocabEmbedding embed(ctx, "embed_tokens", &embed_root);
+    embed_root.packed_mapping().rules.push_back({"model.language_model.", "model.", 0});
+    embed_root.packed_mapping().rules.push_back({"language_model.", "model.", 0});
+
+    ov::genai::modeling::weights::LoadOptions options;
+    options.allow_unmatched = true;
+    options.allow_missing = false;
+    options.report_unmatched = false;
+    options.report_missing = true;
+    ov::genai::modeling::weights::load_model(embed_root, target_source, target_finalizer, options);
+
+    // ── Draft layers (draft weights) ──
+    DFlashDraftModel draft_model(ctx, draft_cfg);
+    ov::genai::modeling::weights::load_model(draft_model, draft_source, draft_finalizer);
+
+    // ── LM head (target weights, tied to embed_tokens when configured) ──
+    Module lm_root("", ctx);
+    LMHead head(ctx, "lm_head", &lm_root);
+    if (qwen_cfg.tie_word_embeddings) {
+        head.tie_to(embed.weight_param());
+    } else if (!target_source.has("lm_head.weight")) {
+        const std::vector<std::string> embed_candidates = {
+            "model.embed_tokens.weight",
+            "model.language_model.embed_tokens.weight",
+            "language_model.embed_tokens.weight",
+        };
+        std::string embed_weight;
+        for (const auto& name : embed_candidates) {
+            if (target_source.has(name)) { embed_weight = name; break; }
+        }
+        if (!embed_weight.empty()) {
+            auto tied = target_finalizer.finalize(embed_weight, target_source, ctx.op_context());
+            head.weight_param().bind(tied);
+        }
+    }
+    ov::genai::modeling::weights::load_model(lm_root, target_source, target_finalizer, options);
+
+    // ── Inputs ──
+    const ov::element::Type dtype = ov::element::f32;
+    auto context_hidden = ctx.parameter("context_hidden", dtype,
+                                        ov::PartialShape{-1, -1, draft_cfg.hidden_size});
+    auto input_ids = ctx.parameter("input_ids", ov::element::i64, ov::PartialShape{-1, -1});
+    auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
+
+    // ── Forward: embed → draft_with_context → lm_head (single graph, no fc) ──
+    auto noise_embedding = embed.forward(input_ids);
+    auto draft_hidden = draft_model.forward_with_context(context_hidden, noise_embedding, position_ids);
+    auto logits = head.forward(draft_hidden);
+
+    // ── Output ──
     auto logits_result = std::make_shared<ov::op::v0::Result>(logits.output());
     set_name(logits_result, "logits");
 

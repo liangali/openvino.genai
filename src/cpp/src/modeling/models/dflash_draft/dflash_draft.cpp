@@ -418,6 +418,23 @@ Tensor DFlashDraftModel::forward_with_cached_kv(
     return norm_.forward(hidden_states);
 }
 
+Tensor DFlashDraftModel::compute_context_hidden(const Tensor& target_hidden) const {
+    auto conditioned = ops::linear(target_hidden, fc_weight());
+    return hidden_norm_.forward(conditioned);
+}
+
+Tensor DFlashDraftModel::forward_with_context(const Tensor& context_hidden,
+                                               const Tensor& noise_embedding,
+                                               const Tensor& position_ids) const {
+    auto hidden_states = noise_embedding;
+    auto* policy = &ctx().op_policy();
+    auto cos_sin = ops::llm::rope_cos_sin(position_ids, head_dim_, rope_theta_, policy);
+    for (const auto& layer : layers_) {
+        hidden_states = layer.forward(context_hidden, hidden_states, cos_sin.first, cos_sin.second);
+    }
+    return norm_.forward(hidden_states);
+}
+
 std::shared_ptr<ov::Model> create_dflash_draft_model(
     const DFlashDraftConfig& cfg,
     ov::genai::modeling::weights::WeightSource& source,
@@ -432,7 +449,7 @@ std::shared_ptr<ov::Model> create_dflash_draft_model(
     const ov::element::Type dtype = ov::element::f32;
 
     const int64_t ctx_dim = static_cast<int64_t>(cfg.hidden_size) *
-                            static_cast<int64_t>(cfg.num_hidden_layers);
+                            static_cast<int64_t>(cfg.num_ctx_layers());
     auto target_hidden = ctx.parameter("target_hidden", dtype, ov::PartialShape{-1, -1, ctx_dim});
     auto noise_embedding = ctx.parameter("noise_embedding", dtype, ov::PartialShape{-1, -1, cfg.hidden_size});
     auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
@@ -501,6 +518,7 @@ std::shared_ptr<ov::Model> build_dflash_model(
     cfg.rope_theta = config.rope_theta;
     cfg.hidden_act = config.hidden_act;
     cfg.attention_bias = config.attention_bias;
+    cfg.target_layer_ids = config.target_layer_ids;
 
     return create_dflash_draft_model(cfg, weight_source, weight_finalizer, ov::element::f32);
 }

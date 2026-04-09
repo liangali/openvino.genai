@@ -386,6 +386,7 @@ ModelConfig ModelConfig::from_hf_json(const std::filesystem::path& config_path) 
     // DFlash-specific
     config.block_size = extract_json_int(json, "block_size", 0);
     config.num_target_layers = extract_json_int(json, "num_target_layers", 0);
+    config.target_layer_ids = extract_json_int_array(json, "target_layer_ids");
     {
         auto dflash_json = extract_json_object(json, "dflash_config");
         if (!dflash_json.empty()) {

@@ -47,6 +47,15 @@ struct DFlashDraftConfig {
     float rope_theta = 10000.0f;
     std::string hidden_act = "silu";
     bool attention_bias = false;
+    std::vector<int32_t> target_layer_ids;
+
+    /// Number of context layers for ctx_dim computation.
+    /// Uses explicit target_layer_ids count if available, else falls back to num_hidden_layers.
+    int32_t num_ctx_layers() const {
+        return target_layer_ids.empty()
+            ? num_hidden_layers
+            : static_cast<int32_t>(target_layer_ids.size());
+    }
 };
 
 class DFlashAttention : public Module {
@@ -191,6 +200,16 @@ public:
         const Tensor& noise_embedding,
         const Tensor& position_ids,
         const std::vector<std::pair<Tensor, Tensor>>& context_kv) const;
+
+    /// Compute context_hidden from target_hidden (fc + hidden_norm only).
+    /// Used by context_fc model to cache the result.
+    Tensor compute_context_hidden(const Tensor& target_hidden) const;
+
+    /// Forward with pre-computed context_hidden (skips fc + hidden_norm).
+    /// context_hidden: [1, T, hidden_size] from compute_context_hidden().
+    Tensor forward_with_context(const Tensor& context_hidden,
+                                const Tensor& noise_embedding,
+                                const Tensor& position_ids) const;
 
 private:
     const Tensor& fc_weight() const;

@@ -97,6 +97,9 @@ struct ModelConfig {
     /// Mask token ID for DFlash draft model (from dflash_config.mask_token_id in config.json)
     int64_t mask_token_id = -1;
 
+    /// Explicit target layer IDs from dflash_config (if present in config.json)
+    std::vector<int32_t> target_layer_ids;
+    
     // ========== Normalization ==========
     
     /// RMS normalization epsilon
