@@ -141,7 +141,8 @@ public:
     Tensor forward(const Tensor& hidden_states,
                    const Tensor& beam_idx,
                    const Tensor* attention_mask,
-                   const Tensor* cache_position) const;
+                   const Tensor* cache_position,
+                   const Tensor* state_update_mode = nullptr) const;
 
 private:
     const Tensor& in_proj_qkv_weight() const;
@@ -219,6 +220,7 @@ public:
                                       const Tensor* linear_attention_mask,
                                       const Tensor* cache_position,
                                       const std::optional<Tensor>& residual,
+                                      const Tensor* state_update_mode = nullptr,
                                       const Tensor* precomputed_full_attn_sdpa_mask = nullptr) const;
 
 private:
@@ -242,7 +244,8 @@ public:
                    const Tensor* linear_attention_mask,
                    const Tensor* cache_position,
                    const Tensor* visual_embeds = nullptr,
-                   const Tensor* visual_pos_mask = nullptr);
+                   const Tensor* visual_pos_mask = nullptr,
+                   const Tensor* state_update_mode = nullptr);
     Tensor forward_embeds(const Tensor& inputs_embeds,
                           const Tensor& position_ids,
                           const Tensor& beam_idx,
@@ -250,9 +253,22 @@ public:
                           const Tensor* linear_attention_mask,
                           const Tensor* cache_position,
                           const Tensor* visual_embeds = nullptr,
-                          const Tensor* visual_pos_mask = nullptr);
+                          const Tensor* visual_pos_mask = nullptr,
+                          const Tensor* state_update_mode = nullptr);
 
     VocabEmbedding& embed_tokens();
+
+    std::pair<Tensor, Tensor> forward_with_selected_layers(
+        const Tensor& input_ids,
+        const Tensor& position_ids,
+        const Tensor& beam_idx,
+        const Tensor& full_attention_mask,
+        const Tensor* linear_attention_mask,
+        const Tensor* cache_position,
+        const Tensor* state_update_mode,
+        const std::vector<int32_t>& layer_ids,
+        const Tensor* visual_embeds = nullptr,
+        const Tensor* visual_pos_mask = nullptr);
 
 private:
     Tensor forward_impl(const Tensor* input_ids,
@@ -263,7 +279,8 @@ private:
                         const Tensor* linear_attention_mask,
                         const Tensor* cache_position,
                         const Tensor* visual_embeds,
-                        const Tensor* visual_pos_mask);
+                        const Tensor* visual_pos_mask,
+                        const Tensor* state_update_mode);
     std::pair<Tensor, Tensor> build_mrope_cos_sin(const Tensor& position_ids) const;
 
     Qwen3_5TextModelConfig cfg_;
@@ -274,6 +291,10 @@ private:
     int32_t head_dim_ = 0;
     int32_t rotary_dim_ = 0;
     float rope_theta_ = 10000.0f;
+
+    // Layer capture support — set by forward_with_selected_layers before calling forward_impl
+    std::vector<int32_t> capture_layer_ids_;
+    std::vector<Tensor> captured_hidden_;
 };
 
 class Qwen3_5ForCausalLM : public Module {
@@ -287,7 +308,8 @@ public:
                    const Tensor* linear_attention_mask,
                    const Tensor* cache_position,
                    const Tensor* visual_embeds = nullptr,
-                   const Tensor* visual_pos_mask = nullptr);
+                   const Tensor* visual_pos_mask = nullptr,
+                   const Tensor* state_update_mode = nullptr);
     Tensor forward_embeds(const Tensor& inputs_embeds,
                           const Tensor& position_ids,
                           const Tensor& beam_idx,
@@ -295,7 +317,11 @@ public:
                           const Tensor* linear_attention_mask,
                           const Tensor* cache_position,
                           const Tensor* visual_embeds = nullptr,
-                          const Tensor* visual_pos_mask = nullptr);
+                          const Tensor* visual_pos_mask = nullptr,
+                          const Tensor* state_update_mode = nullptr);
+
+    Qwen3_5Model& model() { return model_; }
+    LMHead& lm_head() { return lm_head_; }
 
 private:
     Qwen3_5TextModelConfig cfg_;
@@ -309,6 +335,73 @@ std::shared_ptr<ov::Model> create_qwen3_5_text_model(
     ov::genai::modeling::weights::WeightFinalizer& finalizer,
     bool use_inputs_embeds = false,
     bool enable_visual_inputs = true);
+
+std::shared_ptr<ov::Model> create_qwen3_5_dflash_target_model(
+    const Qwen3_5Config& cfg,
+    const std::vector<int32_t>& target_layer_ids,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer,
+    int32_t snapshot_block_size = 0,
+    bool enable_visual_inputs = false);
+
+std::shared_ptr<ov::Model> create_qwen3_5_embedding_model(
+    const Qwen3_5Config& cfg,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer);
+
+std::shared_ptr<ov::Model> create_qwen3_5_lm_head_model(
+    const Qwen3_5Config& cfg,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer,
+    const ov::element::Type& input_type = ov::element::f32);
+
+/// Combined embed_tokens + lm_head model for DFlash draft helper.
+/// Two InferRequests from the same CompiledModel share GPU weight memory.
+std::shared_ptr<ov::Model> create_qwen3_5_draft_helper_model(
+    const Qwen3_5Config& cfg,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer,
+    const ov::element::Type& lm_head_input_type = ov::element::f32);
+
+// Forward declaration (defined in dflash_draft.hpp).
+struct DFlashDraftConfig;
+
+/// Combined embed + draft + lm_head model.  Merges three GPU dispatches into
+/// one infer() call per draft step, eliminating kernel-launch & sync overhead.
+/// Inputs:  target_hidden [B, T, hidden*num_draft_layers],
+///          input_ids     [B, block_size],
+///          position_ids  [1, T+block_size]
+/// Output:  logits        [B, block_size, vocab_size]
+std::shared_ptr<ov::Model> create_qwen3_5_dflash_combined_draft_model(
+    const Qwen3_5Config& qwen_cfg,
+    const DFlashDraftConfig& draft_cfg,
+    ov::genai::modeling::weights::WeightSource& target_source,
+    ov::genai::modeling::weights::WeightFinalizer& target_finalizer,
+    ov::genai::modeling::weights::WeightSource& draft_source,
+    ov::genai::modeling::weights::WeightFinalizer& draft_finalizer);
+
+/// Context KV preprocessing model.  Computes fc + RMSNorm + K,V projections +
+/// KNorm + RoPE for all draft layers.  Runs once per verify cycle on newly
+/// accepted tokens.
+/// Inputs:  target_hidden [1, A, ctx_dim], position_ids [1, A]
+/// Outputs: context_k_i [1, kv_heads, A, head_dim], context_v_i (×num_layers)
+std::shared_ptr<ov::Model> create_qwen3_5_dflash_context_kv_model(
+    const DFlashDraftConfig& draft_cfg,
+    ov::genai::modeling::weights::WeightSource& draft_source,
+    ov::genai::modeling::weights::WeightFinalizer& draft_finalizer);
+
+/// Lightweight draft step model.  Embed → attention using pre-computed context
+/// K,V → MLP → LM head.  Skips fc + context KV computation entirely.
+/// Inputs:  input_ids [1, B], position_ids [1, B],
+///          context_k_i / context_v_i [1, kv_heads, T, head_dim] (×num_layers)
+/// Output:  logits [1, B, vocab_size]
+std::shared_ptr<ov::Model> create_qwen3_5_dflash_step_model(
+    const Qwen3_5Config& qwen_cfg,
+    const DFlashDraftConfig& draft_cfg,
+    ov::genai::modeling::weights::WeightSource& target_source,
+    ov::genai::modeling::weights::WeightFinalizer& target_finalizer,
+    ov::genai::modeling::weights::WeightSource& draft_source,
+    ov::genai::modeling::weights::WeightFinalizer& draft_finalizer);
 
 }  // namespace models
 }  // namespace modeling

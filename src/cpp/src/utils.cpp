@@ -25,6 +25,7 @@
 #ifdef ENABLE_SAFETENSORS
 #include "safetensors_utils/safetensors_modeling.hpp"
 #include "safetensors_utils/safetensors_loader.hpp"
+#include "safetensors_utils/quantization_utils.hpp"
 #endif
 
 
@@ -428,13 +429,38 @@ std::pair<ov::AnyMap, std::optional<ov::genai::modeling::weights::QuantizationCo
     using QConfig = ov::genai::modeling::weights::QuantizationConfig;
     std::optional<QConfig> quant_config = std::nullopt;
     
-    // Check for "QUANTIZATION_CONFIG" key
+    // Check for "QUANTIZATION_CONFIG" key (structured object)
     auto it = plugin_config.find("QUANTIZATION_CONFIG");
     if (it != plugin_config.end()) {
          if (it->second.is<QConfig>()) {
              quant_config = it->second.as<QConfig>();
          }
          plugin_config.erase(it);
+    }
+
+    // Check for string-based "quantization_mode" convenience key (e.g. from Python kwargs).
+    // Takes lower priority than structured QUANTIZATION_CONFIG above.
+    if (!quant_config.has_value()) {
+        auto mode_it = plugin_config.find("quantization_mode");
+        if (mode_it != plugin_config.end() && mode_it->second.is<std::string>()) {
+            std::string mode_str = mode_it->second.as<std::string>();
+            int group_size = 128;
+            auto gs_it = plugin_config.find("quantization_group_size");
+            if (gs_it != plugin_config.end()) {
+                if (gs_it->second.is<int64_t>())
+                    group_size = static_cast<int>(gs_it->second.as<int64_t>());
+                else if (gs_it->second.is<int>())
+                    group_size = gs_it->second.as<int>();
+                plugin_config.erase(gs_it);
+            }
+            plugin_config.erase(mode_it);
+#ifdef ENABLE_SAFETENSORS
+            QConfig cfg = create_quantization_config(mode_str, group_size, "int8_asym");
+            if (cfg.enabled()) {
+                quant_config = cfg;
+            }
+#endif
+        }
     }
     
     return {plugin_config, quant_config};
@@ -518,8 +544,9 @@ std::shared_ptr<ov::Model> read_model(const std::filesystem::path& model_dir,  c
 #ifdef ENABLE_SAFETENSORS
     // Check if directory contains safetensors model (before checking for OpenVINO IR)
     if (std::filesystem::is_directory(model_dir) && is_safetensors_model_dir(model_dir)) {
-        // If OpenVINO model already exists, use it; otherwise create from safetensors
-        if (!std::filesystem::exists(model_dir / "openvino_model.xml")) {
+        // If OpenVINO model already exists and no quantization is requested, use the cached IR.
+        // When quantization is requested, always load from safetensors so weights can be quantized on-the-fly.
+        if (!std::filesystem::exists(model_dir / "openvino_model.xml") || quant_config.has_value()) {
              ov::genai::modeling::weights::QuantizationConfig q_conf;
              if (quant_config.has_value()) {
                  q_conf = *quant_config;
@@ -634,6 +661,49 @@ void trim_kv_cache(ov::InferRequest request, KVCacheState& kv_cache_state, std::
 
     OPENVINO_ASSERT(states.size() > 0, "Request contains no states.");
 
+    // Try GPU-optimized in-place trim first (zero-copy buffer reinterpretation).
+    // All states from the same InferRequest share one plugin, so if the first
+    // KV state supports set_shape(), all of them do.
+    try {
+        for (auto& state : states) {
+            if (adapter_controller && adapter_controller->has_state_name(state.get_name()))
+                continue;
+
+            if (!is_attention_kv_state_name(state.get_name()))
+                continue;
+
+            auto shape = state.get_shape();
+            if (kv_cache_state.seq_length_axis >= shape.size())
+                continue;
+
+            const size_t seq_axis = kv_cache_state.seq_length_axis;
+            const size_t old_seq_len = shape[seq_axis];
+            const size_t trim = std::min<size_t>(old_seq_len, kv_cache_state.num_tokens_to_trim);
+            if (trim == 0)
+                continue;
+
+            shape[seq_axis] = old_seq_len - trim;
+            state.set_shape(shape);
+        }
+        return;  // GPU-optimized trim succeeded
+    } catch (const ov::NotImplemented& e) {
+        // set_shape() not supported by this plugin — fall through to CPU path
+        static bool warned = false;
+        if (!warned) {
+            std::cerr << "[trim_kv] GPU zero-copy path not available (" << e.what()
+                      << "), falling back to CPU copy path.\n";
+            warned = true;
+        }
+    } catch (const std::exception& e) {
+        static bool warned2 = false;
+        if (!warned2) {
+            std::cerr << "[trim_kv] GPU path failed with exception: " << e.what()
+                      << ", falling back to CPU copy path.\n";
+            warned2 = true;
+        }
+    }
+
+    // CPU fallback: read state from device, trim on host, write back.
     for (auto& state : states) {
         if(adapter_controller && adapter_controller->has_state_name(state.get_name()))
             continue;

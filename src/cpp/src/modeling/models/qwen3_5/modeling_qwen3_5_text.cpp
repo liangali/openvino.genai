@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <tuple>
 
 #include <openvino/core/except.hpp>
 #include <openvino/openvino.hpp>
@@ -15,6 +16,7 @@
 #include <openvino/opsets/opset13.hpp>
 #include <ov_ops/rms.hpp>
 
+#include "modeling/models/dflash_draft/dflash_draft.hpp"
 #include "modeling/ops/kv_cache.hpp"
 #include "modeling/ops/llm.hpp"
 #include "modeling/ops/ops.hpp"
@@ -71,6 +73,29 @@ bool use_fused_conv_op() {
         return true;  // enabled by default
     return std::string(raw) != "0";
 }
+
+bool use_state_snapshots() {
+    const char* raw = std::getenv("OV_GENAI_DISABLE_STATE_SNAPSHOTS");
+    if (raw && std::string(raw) == "1")
+        return false;
+    return true;  // enabled by default
+}
+
+// When set, forces snapshot outputs even in the normal (non-DFlash) model builder.
+// Used for benchmarking snapshot kernel overhead in isolation.
+bool force_state_snapshots() {
+    const char* raw = std::getenv("OV_GENAI_FORCE_STATE_SNAPSHOTS");
+    return raw && std::string(raw) == "1";
+}
+
+// Accumulator for snapshot outputs during model construction.
+// GatedDeltaNet::forward() pushes {name, output} pairs here when snapshots are enabled.
+struct SnapshotOutputAccumulator {
+    std::vector<std::pair<std::string, ov::Output<ov::Node>>> entries;
+    bool active = false;
+    int64_t snapshot_max_seq = 0; 
+};
+static SnapshotOutputAccumulator g_snapshot_accumulator;
 
 ov::genai::modeling::models::Qwen3_5TextModelConfig apply_qwen3_5_layer_limit(
     const ov::genai::modeling::models::Qwen3_5TextModelConfig& input_cfg) {
@@ -433,9 +458,13 @@ Tensor Qwen3_5GatedDeltaNet::rms_norm_gated(const Tensor& x, const Tensor& z) co
 Tensor Qwen3_5GatedDeltaNet::forward(const Tensor& hidden_states,
                                        const Tensor& beam_idx,
                                        const Tensor* attention_mask,
-                                       const Tensor* cache_position) const {
+                                       const Tensor* cache_position,
+                                       const Tensor* state_update_mode) const {
     (void)cache_position;
     auto* op_ctx = hidden_states.context();
+    Tensor state_update_mode_tensor = state_update_mode
+        ? *state_update_mode
+        : Tensor(ops::const_vec(op_ctx, std::vector<int32_t>{1}), op_ctx);
 
     Tensor masked_hidden = hidden_states;
     if (attention_mask) {
@@ -473,14 +502,18 @@ Tensor Qwen3_5GatedDeltaNet::forward(const Tensor& hidden_states,
         // ── FusedConv op path: fuses Gather + Concat + GroupConv + SiLU + Slice ──
         auto conv_w_2d = conv1d_weight().reshape({conv_dim_, conv_kernel_size_}, false);
 
-        auto fused_result = ops::fused_conv(
-            mixed_qkv,                                     // [B, conv_dim, S]
-            conv_w_2d,                                      // [conv_dim, kernel_size]
-            beam_idx,                                       // [B]
-            conv_init,                                       // [B, conv_dim, kernel_size]
-            conv_var);
-
-        mixed_after_conv = fused_result.first;              // [B, conv_dim, S]
+        if (g_snapshot_accumulator.active) {
+            auto [conv_out, conv_state, conv_snap] = ops::fused_conv_with_snapshots(
+                mixed_qkv, conv_w_2d, beam_idx, conv_init, conv_var, state_update_mode_tensor,
+                g_snapshot_accumulator.snapshot_max_seq);
+            mixed_after_conv = conv_out;
+            g_snapshot_accumulator.entries.push_back(
+                {"snapshot." + conv_info.variable_id, conv_snap.output()});
+        } else {
+            auto fused_result = ops::fused_conv(
+                mixed_qkv, conv_w_2d, beam_idx, conv_init, conv_var, state_update_mode_tensor);
+            mixed_after_conv = fused_result.first;
+        }
     } else {
         // ── Fallback: original decomposed path ──
         auto conv_read = std::make_shared<ov::op::v6::ReadValue>(conv_init.output(), conv_var);
@@ -536,8 +569,17 @@ Tensor Qwen3_5GatedDeltaNet::forward(const Tensor& hidden_states,
         // No ReadValue/Assign — LinearAttention manages the variable exclusively.
         // The GPU impl reads from variable memory (if set) or from recurrent_init (first iteration),
         // and writes updated state directly to variable memory.
-        auto la_result = ops::linear_attention(q_f32, k_f32, v_f32, beta, g, recurrent_init, recurrent_var);
-        core_attn_tensor = la_result.first;   // [B, S, num_v_heads, head_v_dim]
+        if (g_snapshot_accumulator.active) {
+            auto [attn_out, recur_state, recur_snap] = ops::linear_attention_with_snapshots(
+                q_f32, k_f32, v_f32, beta, g, recurrent_init, recurrent_var, state_update_mode_tensor,
+                g_snapshot_accumulator.snapshot_max_seq);
+            core_attn_tensor = attn_out;
+            g_snapshot_accumulator.entries.push_back(
+                {"snapshot." + recurrent_info.variable_id, recur_snap.output()});
+        } else {
+            auto la_result = ops::linear_attention(q_f32, k_f32, v_f32, beta, g, recurrent_init, recurrent_var, state_update_mode_tensor);
+            core_attn_tensor = la_result.first;
+        }
     } else {
         // ── TensorIterator path (default) ──
         // Traditional ReadValue + Gather + Assign pattern for variable state management.
@@ -650,6 +692,7 @@ std::pair<Tensor, Tensor> Qwen3_5DecoderLayer::forward(const Tensor& hidden_stat
                                                          const Tensor* linear_attention_mask,
                                                          const Tensor* cache_position,
                                                          const std::optional<Tensor>& residual,
+                                                         const Tensor* state_update_mode,
                                                          const Tensor* precomputed_full_attn_sdpa_mask) const {
     Tensor normed;
     Tensor next_residual;
@@ -671,7 +714,7 @@ std::pair<Tensor, Tensor> Qwen3_5DecoderLayer::forward(const Tensor& hidden_stat
                                     full_attention_mask,
                                     precomputed_full_attn_sdpa_mask);
     } else {
-        mixed = linear_attn_->forward(normed, beam_idx, linear_attention_mask, cache_position);
+        mixed = linear_attn_->forward(normed, beam_idx, linear_attention_mask, cache_position, state_update_mode);
     }
 
     auto post = post_attention_layernorm_.forward(mixed, next_residual);
@@ -759,7 +802,8 @@ Tensor Qwen3_5Model::forward_impl(const Tensor* input_ids,
                                   const Tensor* linear_attention_mask,
                                   const Tensor* cache_position,
                                   const Tensor* visual_embeds,
-                                  const Tensor* visual_pos_mask) {
+                                  const Tensor* visual_pos_mask,
+                                  const Tensor* state_update_mode) {
     OPENVINO_ASSERT((input_ids != nullptr) || (inputs_embeds != nullptr),
                     "Either input_ids or inputs_embeds must be provided");
     OPENVINO_ASSERT(!(input_ids != nullptr && inputs_embeds != nullptr),
@@ -827,9 +871,14 @@ Tensor Qwen3_5Model::forward_impl(const Tensor* input_ids,
         linear_mask = &(*linear_mask_view);
     }
 
+    // Sort capture IDs for efficient lookup during the layer loop
+    auto sorted_capture_ids = capture_layer_ids_;
+    std::sort(sorted_capture_ids.begin(), sorted_capture_ids.end());
+    size_t capture_idx = 0;
+
     std::optional<Tensor> residual;
-    for (auto& layer : layers_) {
-        auto out = layer.forward(hidden_states,
+    for (size_t i = 0; i < layers_.size(); ++i) {
+        auto out = layers_[i].forward(hidden_states,
                                  beam_idx,
                                  cos_sin.first,
                                  cos_sin.second,
@@ -837,9 +886,18 @@ Tensor Qwen3_5Model::forward_impl(const Tensor* input_ids,
                                  linear_mask,
                                  cache_position,
                                  residual,
+                                 state_update_mode,
                                  &shared_full_attn_sdpa_mask);
         hidden_states = out.first;
         residual = out.second;
+
+        // Capture intermediate hidden state at selected layer indices
+        if (capture_idx < sorted_capture_ids.size() &&
+            static_cast<int32_t>(i) == sorted_capture_ids[capture_idx]) {
+            Tensor pre_norm = residual ? (hidden_states + *residual) : hidden_states;
+            captured_hidden_.push_back(pre_norm);
+            ++capture_idx;
+        }
     }
 
     if (residual) {
@@ -855,7 +913,8 @@ Tensor Qwen3_5Model::forward(const Tensor& input_ids,
                              const Tensor* linear_attention_mask,
                              const Tensor* cache_position,
                              const Tensor* visual_embeds,
-                             const Tensor* visual_pos_mask) {
+                             const Tensor* visual_pos_mask,
+                             const Tensor* state_update_mode) {
     return forward_impl(&input_ids,
                         nullptr,
                         position_ids,
@@ -864,7 +923,8 @@ Tensor Qwen3_5Model::forward(const Tensor& input_ids,
                         linear_attention_mask,
                         cache_position,
                         visual_embeds,
-                        visual_pos_mask);
+                        visual_pos_mask,
+                        state_update_mode);
 }
 
 Tensor Qwen3_5Model::forward_embeds(const Tensor& inputs_embeds,
@@ -874,7 +934,8 @@ Tensor Qwen3_5Model::forward_embeds(const Tensor& inputs_embeds,
                                     const Tensor* linear_attention_mask,
                                     const Tensor* cache_position,
                                     const Tensor* visual_embeds,
-                                    const Tensor* visual_pos_mask) {
+                                    const Tensor* visual_pos_mask,
+                                    const Tensor* state_update_mode) {
     return forward_impl(nullptr,
                         &inputs_embeds,
                         position_ids,
@@ -883,7 +944,8 @@ Tensor Qwen3_5Model::forward_embeds(const Tensor& inputs_embeds,
                         linear_attention_mask,
                         cache_position,
                         visual_embeds,
-                        visual_pos_mask);
+                        visual_pos_mask,
+                        state_update_mode);
 }
 
 VocabEmbedding& Qwen3_5Model::embed_tokens() {
@@ -907,7 +969,8 @@ Tensor Qwen3_5ForCausalLM::forward(const Tensor& input_ids,
                                    const Tensor* linear_attention_mask,
                                    const Tensor* cache_position,
                                    const Tensor* visual_embeds,
-                                   const Tensor* visual_pos_mask) {
+                                   const Tensor* visual_pos_mask,
+                                   const Tensor* state_update_mode) {
     auto hidden = model_.forward(input_ids,
                                  position_ids,
                                  beam_idx,
@@ -915,7 +978,8 @@ Tensor Qwen3_5ForCausalLM::forward(const Tensor& input_ids,
                                  linear_attention_mask,
                                  cache_position,
                                  visual_embeds,
-                                 visual_pos_mask);
+                                 visual_pos_mask,
+                                 state_update_mode);
     return lm_head_.forward(hidden);
 }
 
@@ -926,7 +990,8 @@ Tensor Qwen3_5ForCausalLM::forward_embeds(const Tensor& inputs_embeds,
                                           const Tensor* linear_attention_mask,
                                           const Tensor* cache_position,
                                           const Tensor* visual_embeds,
-                                          const Tensor* visual_pos_mask) {
+                                          const Tensor* visual_pos_mask,
+                                          const Tensor* state_update_mode) {
     auto hidden = model_.forward_embeds(inputs_embeds,
                                         position_ids,
                                         beam_idx,
@@ -934,16 +999,43 @@ Tensor Qwen3_5ForCausalLM::forward_embeds(const Tensor& inputs_embeds,
                                         linear_attention_mask,
                                         cache_position,
                                         visual_embeds,
-                                        visual_pos_mask);
+                                        visual_pos_mask,
+                                        state_update_mode);
     return lm_head_.forward(hidden);
 }
 
-std::shared_ptr<ov::Model> create_qwen3_5_text_model(
-    const Qwen3_5Config& cfg,
-    ov::genai::modeling::weights::WeightSource& source,
-    ov::genai::modeling::weights::WeightFinalizer& finalizer,
-    bool use_inputs_embeds,
-    bool enable_visual_inputs) {
+std::pair<Tensor, Tensor> Qwen3_5Model::forward_with_selected_layers(
+    const Tensor& input_ids,
+    const Tensor& position_ids,
+    const Tensor& beam_idx,
+    const Tensor& full_attention_mask,
+    const Tensor* linear_attention_mask,
+    const Tensor* cache_position,
+    const Tensor* state_update_mode,
+    const std::vector<int32_t>& layer_ids,
+    const Tensor* visual_embeds,
+    const Tensor* visual_pos_mask) {
+    // Set up captures, then delegate to the shared forward_impl path
+    capture_layer_ids_ = layer_ids;
+    captured_hidden_.clear();
+
+    auto final_out = forward(input_ids, position_ids, beam_idx, full_attention_mask,
+                             linear_attention_mask, cache_position,
+                             visual_embeds, visual_pos_mask, state_update_mode);
+
+    capture_layer_ids_.clear();
+
+    if (captured_hidden_.empty()) {
+        return {final_out, final_out};
+    }
+    auto concat_hidden = ops::concat(captured_hidden_, 2);
+    captured_hidden_.clear();
+    return {final_out, concat_hidden};
+}
+
+namespace {
+
+Qwen3_5TextModelConfig make_text_model_config(const Qwen3_5Config& cfg) {
     Qwen3_5TextModelConfig text_cfg;
     text_cfg.architecture = "qwen3_5";
     text_cfg.hidden_size = cfg.text.hidden_size;
@@ -976,6 +1068,18 @@ std::shared_ptr<ov::Model> create_qwen3_5_text_model(
     text_cfg.router_aux_loss_coef = cfg.text.router_aux_loss_coef;
     text_cfg.mrope_interleaved = cfg.text.rope.mrope_interleaved;
     text_cfg.mrope_section = cfg.text.rope.mrope_section;
+    return text_cfg;
+}
+
+}  // namespace
+
+std::shared_ptr<ov::Model> create_qwen3_5_text_model(
+    const Qwen3_5Config& cfg,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer,
+    bool use_inputs_embeds,
+    bool enable_visual_inputs) {
+    auto text_cfg = make_text_model_config(cfg);
 
     const auto effective_cfg = apply_qwen3_5_layer_limit(text_cfg);
 
@@ -1026,6 +1130,14 @@ std::shared_ptr<ov::Model> create_qwen3_5_text_model(
         visual_pos_mask_ptr = &visual_pos_mask;
     }
 
+    // Optionally activate snapshot accumulation for kernel overhead benchmarking
+    const bool do_snapshots = force_state_snapshots() && use_state_snapshots()
+                              && use_fused_conv_op() && use_linear_attention_op();
+    if (do_snapshots) {
+        g_snapshot_accumulator.entries.clear();
+        g_snapshot_accumulator.active = true;
+    }
+
     Tensor logits;
     if (use_inputs_embeds) {
         logits = model.forward_embeds(inputs_embeds,
@@ -1040,12 +1152,443 @@ std::shared_ptr<ov::Model> create_qwen3_5_text_model(
         logits = model.forward(input_ids, position_ids, beam_idx, attention_mask, &attention_mask, nullptr, visual_embeds_ptr, visual_pos_mask_ptr);
     }
 
+    if (do_snapshots) {
+        g_snapshot_accumulator.active = false;
+    }
+
     auto result = std::make_shared<ov::op::v0::Result>(logits.output());
     set_name(result, Qwen3_5TextIO::kLogits);
-    auto ov_model = ctx.build_model({result->output(0)});
+
+    ov::OutputVector model_outputs = {result->output(0)};
+    if (do_snapshots) {
+        for (auto& [name, output] : g_snapshot_accumulator.entries) {
+            auto snap_result = std::make_shared<ov::op::v0::Result>(output);
+            set_name(snap_result, name);
+            model_outputs.push_back(snap_result->output(0));
+        }
+        g_snapshot_accumulator.entries.clear();
+    }
+    auto ov_model = ctx.build_model(model_outputs);
     ov_model->set_rt_info(ov::element::f16, {"runtime_options", ov::hint::kv_cache_precision.name()});
     ov_model->set_rt_info(8.0f, {"runtime_options", ov::hint::activations_scale_factor.name()});
     return ov_model;
+}
+
+std::shared_ptr<ov::Model> create_qwen3_5_dflash_target_model(
+    const Qwen3_5Config& cfg,
+    const std::vector<int32_t>& target_layer_ids,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer,
+    int32_t snapshot_block_size,
+    bool enable_visual_inputs) {
+    auto text_cfg = make_text_model_config(cfg);
+    const auto effective_cfg = apply_qwen3_5_layer_limit(text_cfg);
+
+    BuilderContext ctx;
+    Qwen3_5ForCausalLM model(ctx, effective_cfg);
+
+    for (int32_t i = 0; i < effective_cfg.num_hidden_layers; ++i) {
+        const std::string idx = std::to_string(i);
+        model.packed_mapping().rules.push_back(
+            {"model.language_model.layers." + idx + ".", "model.layers[" + idx + "].", 0});
+        model.packed_mapping().rules.push_back(
+            {"language_model.layers." + idx + ".", "model.layers[" + idx + "].", 0});
+    }
+    model.packed_mapping().rules.push_back({"model.language_model.", "model.", 0});
+    model.packed_mapping().rules.push_back({"language_model.", "model.", 0});
+
+    ov::genai::modeling::weights::LoadOptions options;
+    options.allow_missing = false;
+    options.allow_unmatched = true;
+    options.report_missing = true;
+    options.report_unmatched = false;
+    (void)ov::genai::modeling::weights::load_model(model, source, finalizer, options);
+
+    auto input_ids = ctx.parameter(Qwen3_5TextIO::kInputIds, ov::element::i64, ov::PartialShape{-1, -1});
+    auto attention_mask = ctx.parameter(Qwen3_5TextIO::kAttentionMask, ov::element::i64, ov::PartialShape{-1, -1});
+    auto position_ids = ctx.parameter(Qwen3_5TextIO::kPositionIds, ov::element::i64, ov::PartialShape{3, -1, -1});
+    auto beam_idx = ctx.parameter(Qwen3_5TextIO::kBeamIdx, ov::element::i32, ov::PartialShape{-1});
+    auto state_update_mode = ctx.parameter("state_update_mode", ov::element::i32, ov::PartialShape{1});
+
+    const Tensor* visual_embeds_ptr = nullptr;
+    const Tensor* visual_pos_mask_ptr = nullptr;
+    Tensor visual_embeds;
+    Tensor visual_pos_mask;
+    if (enable_visual_inputs) {
+        visual_embeds = ctx.parameter(Qwen3_5TextIO::kVisualEmbeds, ov::element::f32,
+                                       ov::PartialShape{-1, -1, cfg.text.hidden_size});
+        visual_pos_mask = ctx.parameter(Qwen3_5TextIO::kVisualPosMask, ov::element::boolean,
+                                         ov::PartialShape{-1, -1});
+        visual_embeds_ptr = &visual_embeds;
+        visual_pos_mask_ptr = &visual_pos_mask;
+    }
+
+    // Enable snapshot accumulation during model construction
+    g_snapshot_accumulator.entries.clear();
+    g_snapshot_accumulator.active = use_state_snapshots() && use_fused_conv_op() && use_linear_attention_op();
+    g_snapshot_accumulator.snapshot_max_seq = snapshot_block_size;
+
+    auto outputs = model.model().forward_with_selected_layers(
+        input_ids, position_ids, beam_idx, attention_mask, &attention_mask, nullptr, &state_update_mode, target_layer_ids,
+        visual_embeds_ptr, visual_pos_mask_ptr);
+
+    g_snapshot_accumulator.active = false;
+
+    auto logits = model.lm_head().forward(outputs.first);
+    auto hidden_out = outputs.second;
+
+    auto logits_result = std::make_shared<ov::op::v0::Result>(logits.output());
+    auto hidden_result = std::make_shared<ov::op::v0::Result>(hidden_out.output());
+    set_name(logits_result, "logits");
+    set_name(hidden_result, "target_hidden");
+
+    ov::OutputVector model_outputs = {logits_result->output(0), hidden_result->output(0)};
+
+    // Add snapshot outputs as named model results
+    for (auto& [name, output] : g_snapshot_accumulator.entries) {
+        auto result = std::make_shared<ov::op::v0::Result>(output);
+        set_name(result, name);
+        model_outputs.push_back(result->output(0));
+    }
+    g_snapshot_accumulator.entries.clear();
+
+    auto ov_model = ctx.build_model(model_outputs);
+
+    ov_model->set_rt_info(ov::element::f16, {"runtime_options", ov::hint::kv_cache_precision.name()});
+    ov_model->set_rt_info(8.0f, {"runtime_options", ov::hint::activations_scale_factor.name()});
+    return ov_model;
+}
+
+std::shared_ptr<ov::Model> create_qwen3_5_embedding_model(
+    const Qwen3_5Config& cfg,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer) {
+    (void)cfg;
+    BuilderContext ctx;
+
+    Module root("model", ctx);
+    VocabEmbedding embed(ctx, "embed_tokens", &root);
+
+    // Add HF weight mapping rules for Qwen3.5
+    root.packed_mapping().rules.push_back({"model.language_model.", "model.", 0});
+    root.packed_mapping().rules.push_back({"language_model.", "model.", 0});
+
+    ov::genai::modeling::weights::LoadOptions options;
+    options.allow_unmatched = true;
+    options.allow_missing = false;
+    options.report_unmatched = false;
+    options.report_missing = true;
+    ov::genai::modeling::weights::load_model(root, source, finalizer, options);
+
+    auto input_ids = ctx.parameter("input_ids", ov::element::i64, ov::PartialShape{-1, -1});
+    auto output = embed.forward(input_ids);
+
+    auto result = std::make_shared<ov::op::v0::Result>(output.output());
+    set_name(result, "embeddings");
+    return ctx.build_model({result->output(0)});
+}
+
+std::shared_ptr<ov::Model> create_qwen3_5_lm_head_model(
+    const Qwen3_5Config& cfg,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer,
+    const ov::element::Type& input_type) {
+    BuilderContext ctx;
+
+    Module root("", ctx);
+    LMHead head(ctx, "lm_head", &root);
+
+    if (!source.has("lm_head.weight") && cfg.tie_word_embeddings) {
+        // Qwen3.5 safetensors may use several naming conventions depending on
+        // whether the checkpoint is text-only or VLM.
+        const std::vector<std::string> embed_candidates = {
+            "model.embed_tokens.weight",
+            "model.language_model.embed_tokens.weight",
+            "language_model.embed_tokens.weight",
+        };
+        std::string embed_weight;
+        for (const auto& name : embed_candidates) {
+            if (source.has(name)) {
+                embed_weight = name;
+                break;
+            }
+        }
+        if (embed_weight.empty()) {
+            OPENVINO_THROW("Missing lm_head.weight and no embedding weight available to tie.");
+        }
+        auto tied = finalizer.finalize(embed_weight, source, ctx.op_context());
+        head.weight_param().bind(tied);
+    }
+
+    ov::genai::modeling::weights::LoadOptions options;
+    options.allow_unmatched = true;
+    options.allow_missing = false;
+    options.report_unmatched = false;
+    options.report_missing = true;
+    ov::genai::modeling::weights::load_model(root, source, finalizer, options);
+
+    auto hidden = ctx.parameter("hidden_states", input_type, ov::PartialShape{-1, -1, cfg.text.hidden_size});
+    auto logits = head.forward(hidden);
+
+    auto result = std::make_shared<ov::op::v0::Result>(logits.output());
+    set_name(result, "logits");
+    return ctx.build_model({result->output(0)});
+}
+
+std::shared_ptr<ov::Model> create_qwen3_5_draft_helper_model(
+    const Qwen3_5Config& cfg,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer,
+    const ov::element::Type& lm_head_input_type) {
+    BuilderContext ctx;
+
+    // ── Embedding path (under "model" prefix) ──
+    Module embed_root("model", ctx);
+    VocabEmbedding embed(ctx, "embed_tokens", &embed_root);
+
+    embed_root.packed_mapping().rules.push_back({"model.language_model.", "model.", 0});
+    embed_root.packed_mapping().rules.push_back({"language_model.", "model.", 0});
+
+    ov::genai::modeling::weights::LoadOptions options;
+    options.allow_unmatched = true;
+    options.allow_missing = false;
+    options.report_unmatched = false;
+    options.report_missing = true;
+    ov::genai::modeling::weights::load_model(embed_root, source, finalizer, options);
+
+    // ── LM head path (tied to embed_tokens) ──
+    Module lm_root("", ctx);
+    LMHead head(ctx, "lm_head", &lm_root);
+
+    if (cfg.tie_word_embeddings) {
+        head.tie_to(embed.weight_param());
+    } else if (!source.has("lm_head.weight")) {
+        const std::vector<std::string> embed_candidates = {
+            "model.embed_tokens.weight",
+            "model.language_model.embed_tokens.weight",
+            "language_model.embed_tokens.weight",
+        };
+        std::string embed_weight;
+        for (const auto& name : embed_candidates) {
+            if (source.has(name)) { embed_weight = name; break; }
+        }
+        if (!embed_weight.empty()) {
+            auto tied = finalizer.finalize(embed_weight, source, ctx.op_context());
+            head.weight_param().bind(tied);
+        }
+    }
+
+    ov::genai::modeling::weights::load_model(lm_root, source, finalizer, options);
+
+    // ── Inputs ──
+    auto input_ids = ctx.parameter("input_ids", ov::element::i64, ov::PartialShape{-1, -1});
+    auto hidden_states = ctx.parameter("hidden_states", lm_head_input_type,
+                                        ov::PartialShape{-1, -1, cfg.text.hidden_size});
+
+    // ── Forward: both paths always execute (GPU overhead < 1ms for unused path) ──
+    auto embeddings = embed.forward(input_ids);
+    auto logits = head.forward(hidden_states);
+
+    // ── Outputs ──
+    auto embed_result = std::make_shared<ov::op::v0::Result>(embeddings.output());
+    set_name(embed_result, "embeddings");
+    auto logits_result = std::make_shared<ov::op::v0::Result>(logits.output());
+    set_name(logits_result, "logits");
+
+    return ctx.build_model({embed_result->output(0), logits_result->output(0)});
+}
+
+std::shared_ptr<ov::Model> create_qwen3_5_dflash_combined_draft_model(
+    const Qwen3_5Config& qwen_cfg,
+    const DFlashDraftConfig& draft_cfg,
+    ov::genai::modeling::weights::WeightSource& target_source,
+    ov::genai::modeling::weights::WeightFinalizer& target_finalizer,
+    ov::genai::modeling::weights::WeightSource& draft_source,
+    ov::genai::modeling::weights::WeightFinalizer& draft_finalizer) {
+    BuilderContext ctx;
+
+    // ── Embedding path (target weights under "model" prefix) ──
+    Module embed_root("model", ctx);
+    VocabEmbedding embed(ctx, "embed_tokens", &embed_root);
+    embed_root.packed_mapping().rules.push_back({"model.language_model.", "model.", 0});
+    embed_root.packed_mapping().rules.push_back({"language_model.", "model.", 0});
+
+    ov::genai::modeling::weights::LoadOptions options;
+    options.allow_unmatched = true;
+    options.allow_missing = false;
+    options.report_unmatched = false;
+    options.report_missing = true;
+    ov::genai::modeling::weights::load_model(embed_root, target_source, target_finalizer, options);
+
+    // ── Draft layers (draft weights) ──
+    DFlashDraftModel draft_model(ctx, draft_cfg);
+    ov::genai::modeling::weights::load_model(draft_model, draft_source, draft_finalizer);
+
+    // ── LM head (target weights, tied to embed_tokens when configured) ──
+    Module lm_root("", ctx);
+    LMHead head(ctx, "lm_head", &lm_root);
+    if (qwen_cfg.tie_word_embeddings) {
+        head.tie_to(embed.weight_param());
+    } else if (!target_source.has("lm_head.weight")) {
+        const std::vector<std::string> embed_candidates = {
+            "model.embed_tokens.weight",
+            "model.language_model.embed_tokens.weight",
+            "language_model.embed_tokens.weight",
+        };
+        std::string embed_weight;
+        for (const auto& name : embed_candidates) {
+            if (target_source.has(name)) { embed_weight = name; break; }
+        }
+        if (!embed_weight.empty()) {
+            auto tied = target_finalizer.finalize(embed_weight, target_source, ctx.op_context());
+            head.weight_param().bind(tied);
+        }
+    }
+    ov::genai::modeling::weights::load_model(lm_root, target_source, target_finalizer, options);
+
+    // ── Inputs ──
+    const ov::element::Type dtype = ov::element::f32;
+    const int64_t ctx_dim = static_cast<int64_t>(draft_cfg.hidden_size) *
+                            static_cast<int64_t>(draft_cfg.num_hidden_layers);
+    auto target_hidden = ctx.parameter("target_hidden", dtype, ov::PartialShape{-1, -1, ctx_dim});
+    auto input_ids = ctx.parameter("input_ids", ov::element::i64, ov::PartialShape{-1, -1});
+    auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
+
+    // ── Forward: embed → draft → lm_head  (single graph) ──
+    auto noise_embedding = embed.forward(input_ids);
+    auto draft_hidden = draft_model.forward(target_hidden, noise_embedding, position_ids);
+    auto logits = head.forward(draft_hidden);
+
+    // ── Output ──
+    auto logits_result = std::make_shared<ov::op::v0::Result>(logits.output());
+    set_name(logits_result, "logits");
+
+    return ctx.build_model({logits_result->output(0)});
+}
+
+// ============================================================================
+// DFlash Context KV Preprocessing Model
+// ============================================================================
+// Computes fc(target_hidden) → RMSNorm → K,V projections + KNorm + RoPE
+// for all draft layers.  Runs once per verify cycle on newly-accepted tokens.
+// Inputs:  target_hidden [1, A, ctx_dim], position_ids [1, A]
+// Outputs: k_0..k_N [1, kv_heads, A, head_dim], v_0..v_N (same shape)
+std::shared_ptr<ov::Model> create_qwen3_5_dflash_context_kv_model(
+    const DFlashDraftConfig& draft_cfg,
+    ov::genai::modeling::weights::WeightSource& draft_source,
+    ov::genai::modeling::weights::WeightFinalizer& draft_finalizer) {
+    BuilderContext ctx;
+
+    DFlashDraftModel draft_model(ctx, draft_cfg);
+    ov::genai::modeling::weights::load_model(draft_model, draft_source, draft_finalizer);
+
+    const ov::element::Type dtype = ov::element::f32;
+    const int64_t ctx_dim = static_cast<int64_t>(draft_cfg.hidden_size) *
+                            static_cast<int64_t>(draft_cfg.num_hidden_layers);
+    auto target_hidden = ctx.parameter("target_hidden", dtype, ov::PartialShape{-1, -1, ctx_dim});
+    auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
+
+    auto kv_pairs = draft_model.build_context_kv(target_hidden, position_ids);
+
+    ov::OutputVector outputs;
+    for (size_t i = 0; i < kv_pairs.size(); ++i) {
+        auto k_result = std::make_shared<ov::op::v0::Result>(kv_pairs[i].first.output());
+        set_name(k_result, "context_k_" + std::to_string(i));
+        auto v_result = std::make_shared<ov::op::v0::Result>(kv_pairs[i].second.output());
+        set_name(v_result, "context_v_" + std::to_string(i));
+        outputs.push_back(k_result->output(0));
+        outputs.push_back(v_result->output(0));
+    }
+
+    return ctx.build_model(outputs);
+}
+
+// ============================================================================
+// DFlash Lightweight Draft Step Model
+// ============================================================================
+// Embed → attention (with pre-computed context KV) → MLP → lm_head.
+// Runs once per draft cycle.  Skips fc + context KV computation entirely.
+// Inputs:  input_ids [1, B], position_ids [1, B],
+//          context_k_0..N [1, kv_heads, T, head_dim], context_v_0..N (same)
+// Output:  logits [1, B, vocab_size]
+std::shared_ptr<ov::Model> create_qwen3_5_dflash_step_model(
+    const Qwen3_5Config& qwen_cfg,
+    const DFlashDraftConfig& draft_cfg,
+    ov::genai::modeling::weights::WeightSource& target_source,
+    ov::genai::modeling::weights::WeightFinalizer& target_finalizer,
+    ov::genai::modeling::weights::WeightSource& draft_source,
+    ov::genai::modeling::weights::WeightFinalizer& draft_finalizer) {
+    BuilderContext ctx;
+
+    // ── Embedding (target weights) ──
+    Module embed_root("model", ctx);
+    VocabEmbedding embed(ctx, "embed_tokens", &embed_root);
+    embed_root.packed_mapping().rules.push_back({"model.language_model.", "model.", 0});
+    embed_root.packed_mapping().rules.push_back({"language_model.", "model.", 0});
+
+    ov::genai::modeling::weights::LoadOptions options;
+    options.allow_unmatched = true;
+    options.allow_missing = false;
+    options.report_unmatched = false;
+    options.report_missing = true;
+    ov::genai::modeling::weights::load_model(embed_root, target_source, target_finalizer, options);
+
+    // ── Draft layers ──
+    DFlashDraftModel draft_model(ctx, draft_cfg);
+    ov::genai::modeling::weights::load_model(draft_model, draft_source, draft_finalizer);
+
+    // ── LM head (target weights) ──
+    Module lm_root("", ctx);
+    LMHead head(ctx, "lm_head", &lm_root);
+    if (qwen_cfg.tie_word_embeddings) {
+        head.tie_to(embed.weight_param());
+    } else if (!target_source.has("lm_head.weight")) {
+        const std::vector<std::string> embed_candidates = {
+            "model.embed_tokens.weight",
+            "model.language_model.embed_tokens.weight",
+            "language_model.embed_tokens.weight",
+        };
+        std::string embed_weight;
+        for (const auto& name : embed_candidates) {
+            if (target_source.has(name)) { embed_weight = name; break; }
+        }
+        if (!embed_weight.empty()) {
+            auto tied = target_finalizer.finalize(embed_weight, target_source, ctx.op_context());
+            head.weight_param().bind(tied);
+        }
+    }
+    ov::genai::modeling::weights::load_model(lm_root, target_source, target_finalizer, options);
+
+    // ── Inputs ──
+    const ov::element::Type dtype = ov::element::f32;
+    auto input_ids = ctx.parameter("input_ids", ov::element::i64, ov::PartialShape{-1, -1});
+    auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
+
+    // Context KV inputs: one K,V pair per draft layer.
+    const int32_t kv_heads = draft_cfg.num_key_value_heads > 0
+                                 ? draft_cfg.num_key_value_heads
+                                 : draft_cfg.num_attention_heads;
+    const int32_t head_dim = draft_cfg.head_dim > 0
+                                 ? draft_cfg.head_dim
+                                 : (draft_cfg.hidden_size / draft_cfg.num_attention_heads);
+    std::vector<std::pair<Tensor, Tensor>> context_kv;
+    for (int32_t i = 0; i < draft_cfg.num_hidden_layers; ++i) {
+        auto ck = ctx.parameter("context_k_" + std::to_string(i), dtype,
+                                ov::PartialShape{-1, kv_heads, -1, head_dim});
+        auto cv = ctx.parameter("context_v_" + std::to_string(i), dtype,
+                                ov::PartialShape{-1, kv_heads, -1, head_dim});
+        context_kv.push_back({ck, cv});
+    }
+
+    // ── Forward: embed → draft_with_cached_kv → lm_head ──
+    auto noise_embedding = embed.forward(input_ids);
+    auto draft_hidden = draft_model.forward_with_cached_kv(noise_embedding, position_ids, context_kv);
+    auto logits = head.forward(draft_hidden);
+
+    auto logits_result = std::make_shared<ov::op::v0::Result>(logits.output());
+    set_name(logits_result, "logits");
+
+    return ctx.build_model({logits_result->output(0)});
 }
 
 }  // namespace models

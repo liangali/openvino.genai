@@ -58,6 +58,36 @@ public:
                    const Tensor& rope_cos,
                    const Tensor& rope_sin) const;
 
+    /// Build context K,V for preprocessing model.
+    /// Returns {K, V} at [1, num_kv_heads, seq, head_dim], K is post-KNorm + post-RoPE.
+    std::pair<Tensor, Tensor> build_context_kv(const Tensor& context_hidden,
+                                               const Tensor& rope_cos,
+                                               const Tensor& rope_sin) const;
+
+    /// Build attention using pre-computed context K,V (no fc/context recomputation).
+    /// context_k/v: [1, num_kv_heads, T, head_dim], already post-norm/RoPE.
+    /// rope_cos/sin: for draft positions only [1, B, ...].
+    Tensor forward_with_cached_kv(const Tensor& hidden_states,
+                                  const Tensor& context_k,
+                                  const Tensor& context_v,
+                                  const Tensor& rope_cos,
+                                  const Tensor& rope_sin) const;
+
+    /// Post-process raw K,V projections: reshape + KNorm + RoPE (for K), reshape (for V).
+    /// k_proj, v_proj: [1, A, kv_dim].  Returns {K, V} at [1, kv_heads, A, head_dim].
+    std::pair<Tensor, Tensor> post_process_context_kv(const Tensor& k_proj,
+                                                      const Tensor& v_proj,
+                                                      const Tensor& rope_cos,
+                                                      const Tensor& rope_sin) const;
+
+    /// Public weight accessors for batched KV projection.
+    const Tensor& get_k_proj_weight() const { return k_proj_weight(); }
+    const Tensor& get_v_proj_weight() const { return v_proj_weight(); }
+    bool has_kv_bias() const { return attention_bias_; }
+    const Tensor* get_k_proj_bias() const { return k_proj_bias(); }
+    const Tensor* get_v_proj_bias() const { return v_proj_bias(); }
+    int32_t kv_dim() const { return num_kv_heads_ * head_dim_; }
+
 private:
     const Tensor& q_proj_weight() const;
     const Tensor& k_proj_weight() const;
@@ -116,6 +146,21 @@ public:
                    const Tensor& rope_cos,
                    const Tensor& rope_sin) const;
 
+    /// Build context K,V for this layer (delegates to self_attn_).
+    std::pair<Tensor, Tensor> build_context_kv(const Tensor& context_hidden,
+                                               const Tensor& rope_cos,
+                                               const Tensor& rope_sin) const;
+
+    /// Forward with pre-computed context K,V (no context recomputation).
+    Tensor forward_with_cached_kv(const Tensor& hidden_states,
+                                  const Tensor& context_k,
+                                  const Tensor& context_v,
+                                  const Tensor& rope_cos,
+                                  const Tensor& rope_sin) const;
+
+    /// Access the attention module (for batched KV weight collection).
+    const DFlashAttention& attn() const { return self_attn_; }
+
 private:
     DFlashAttention self_attn_;
     DFlashMLP mlp_;
@@ -130,6 +175,22 @@ public:
     Tensor forward(const Tensor& target_hidden,
                    const Tensor& noise_embedding,
                    const Tensor& position_ids) const;
+
+    /// Build context KV preprocessing outputs for all layers.
+    /// Returns vector of {K, V} pairs, one per layer.
+    /// K: [1, num_kv_heads, seq, head_dim] post-KNorm + post-RoPE.
+    /// V: [1, num_kv_heads, seq, head_dim].
+    std::vector<std::pair<Tensor, Tensor>> build_context_kv(
+        const Tensor& target_hidden,
+        const Tensor& position_ids) const;
+
+    /// Forward with pre-computed context K,V caches (skips fc + context KV computation).
+    /// context_kv: vector of {K_i, V_i} pairs from build_context_kv.
+    /// position_ids: draft positions only [1, B].
+    Tensor forward_with_cached_kv(
+        const Tensor& noise_embedding,
+        const Tensor& position_ids,
+        const std::vector<std::pair<Tensor, Tensor>>& context_kv) const;
 
 private:
     const Tensor& fc_weight() const;

@@ -93,7 +93,10 @@ struct ModelConfig {
 
     /// Number of layers in target model (for DFlash conditioning)
     int32_t num_target_layers = 0;
-    
+
+    /// Mask token ID for DFlash draft model (from dflash_config.mask_token_id in config.json)
+    int64_t mask_token_id = -1;
+
     // ========== Normalization ==========
     
     /// RMS normalization epsilon

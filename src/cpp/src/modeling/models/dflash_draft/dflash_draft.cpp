@@ -121,14 +121,10 @@ Tensor DFlashAttention::forward(const Tensor& target_hidden,
                                 const Tensor& hidden_states,
                                 const Tensor& rope_cos,
                                 const Tensor& rope_sin) const {
+    auto kv_input = ops::concat({target_hidden, hidden_states}, 1);
     auto q = add_bias_if_present(ops::linear(hidden_states, q_proj_weight()), q_proj_bias());
-    auto k_ctx = add_bias_if_present(ops::linear(target_hidden, k_proj_weight()), k_proj_bias());
-    auto k_noise = add_bias_if_present(ops::linear(hidden_states, k_proj_weight()), k_proj_bias());
-    auto v_ctx = add_bias_if_present(ops::linear(target_hidden, v_proj_weight()), v_proj_bias());
-    auto v_noise = add_bias_if_present(ops::linear(hidden_states, v_proj_weight()), v_proj_bias());
-
-    auto k = ops::concat({k_ctx, k_noise}, 1);
-    auto v = ops::concat({v_ctx, v_noise}, 1);
+    auto k = add_bias_if_present(ops::linear(kv_input, k_proj_weight()), k_proj_bias());
+    auto v = add_bias_if_present(ops::linear(kv_input, v_proj_weight()), v_proj_bias());
 
     auto q_heads = q.reshape({0, 0, num_heads_, head_dim_}).permute({0, 2, 1, 3});
     auto k_heads = k.reshape({0, 0, num_kv_heads_, head_dim_}).permute({0, 2, 1, 3});
@@ -149,6 +145,86 @@ Tensor DFlashAttention::forward(const Tensor& target_hidden,
 
     auto k_expanded = ops::llm::repeat_kv(k_rot, num_heads_, num_kv_heads_, head_dim_);
     auto v_expanded = ops::llm::repeat_kv(v_heads, num_heads_, num_kv_heads_, head_dim_);
+
+    auto context = ops::llm::sdpa(q_rot, k_expanded, v_expanded, scaling_, 3, nullptr, false, policy);
+    const int64_t attn_out_dim = static_cast<int64_t>(num_heads_) * head_dim_;
+    auto merged = context.permute({0, 2, 1, 3}).reshape({0, 0, attn_out_dim});
+    auto out = add_bias_if_present(ops::linear(merged, o_proj_weight()), o_proj_bias());
+    return out;
+}
+
+std::pair<Tensor, Tensor> DFlashAttention::build_context_kv(const Tensor& context_hidden,
+                                                            const Tensor& rope_cos,
+                                                            const Tensor& rope_sin) const {
+    // K,V projection on context_hidden only (no draft tokens).
+    auto k = add_bias_if_present(ops::linear(context_hidden, k_proj_weight()), k_proj_bias());
+    auto v = add_bias_if_present(ops::linear(context_hidden, v_proj_weight()), v_proj_bias());
+
+    auto k_heads = k.reshape({0, 0, num_kv_heads_, head_dim_}).permute({0, 2, 1, 3});
+    auto v_heads = v.reshape({0, 0, num_kv_heads_, head_dim_}).permute({0, 2, 1, 3});
+
+    if (k_norm_.weight_param().is_bound()) {
+        k_heads = k_norm_.forward(k_heads);
+    }
+
+    auto* policy = &ctx().op_policy();
+    auto k_rot = ops::llm::apply_rope(k_heads, rope_cos, rope_sin, head_dim_, policy);
+
+    return {k_rot, v_heads};  // [1, num_kv_heads, T, head_dim] each
+}
+
+std::pair<Tensor, Tensor> DFlashAttention::post_process_context_kv(const Tensor& k_proj,
+                                                                    const Tensor& v_proj,
+                                                                    const Tensor& rope_cos,
+                                                                    const Tensor& rope_sin) const {
+    // Apply reshape, KNorm, RoPE to raw K projection; just reshape V.
+    auto k_heads = k_proj.reshape({0, 0, num_kv_heads_, head_dim_}).permute({0, 2, 1, 3});
+    auto v_heads = v_proj.reshape({0, 0, num_kv_heads_, head_dim_}).permute({0, 2, 1, 3});
+
+    if (k_norm_.weight_param().is_bound()) {
+        k_heads = k_norm_.forward(k_heads);
+    }
+
+    auto* policy = &ctx().op_policy();
+    auto k_rot = ops::llm::apply_rope(k_heads, rope_cos, rope_sin, head_dim_, policy);
+
+    return {k_rot, v_heads};
+}
+
+Tensor DFlashAttention::forward_with_cached_kv(const Tensor& hidden_states,
+                                               const Tensor& context_k,
+                                               const Tensor& context_v,
+                                               const Tensor& rope_cos,
+                                               const Tensor& rope_sin) const {
+    // Q from draft tokens only.
+    auto q = add_bias_if_present(ops::linear(hidden_states, q_proj_weight()), q_proj_bias());
+    // K,V from draft tokens only (context K,V already pre-computed).
+    auto k = add_bias_if_present(ops::linear(hidden_states, k_proj_weight()), k_proj_bias());
+    auto v = add_bias_if_present(ops::linear(hidden_states, v_proj_weight()), v_proj_bias());
+
+    auto q_heads = q.reshape({0, 0, num_heads_, head_dim_}).permute({0, 2, 1, 3});
+    auto k_heads = k.reshape({0, 0, num_kv_heads_, head_dim_}).permute({0, 2, 1, 3});
+    auto v_heads = v.reshape({0, 0, num_kv_heads_, head_dim_}).permute({0, 2, 1, 3});
+
+    if (q_norm_.weight_param().is_bound()) {
+        q_heads = q_norm_.forward(q_heads);
+    }
+    if (k_norm_.weight_param().is_bound()) {
+        k_heads = k_norm_.forward(k_heads);
+    }
+
+    auto* policy = &ctx().op_policy();
+    // RoPE for draft positions only (cos/sin already scoped to draft positions).
+    auto q_rot = ops::llm::apply_rope(q_heads, rope_cos, rope_sin, head_dim_, policy);
+    auto k_rot = ops::llm::apply_rope(k_heads, rope_cos, rope_sin, head_dim_, policy);
+
+    // Concat cached context K,V with fresh draft K,V.
+    // context_k: [1, num_kv_heads, T, head_dim], k_rot: [1, num_kv_heads, B, head_dim]
+    auto k_full = ops::concat({context_k, k_rot}, 2);
+    auto v_full = ops::concat({context_v, v_heads}, 2);
+
+    auto k_expanded = ops::llm::repeat_kv(k_full, num_heads_, num_kv_heads_, head_dim_);
+    auto v_expanded = ops::llm::repeat_kv(v_full, num_heads_, num_kv_heads_, head_dim_);
 
     auto context = ops::llm::sdpa(q_rot, k_expanded, v_expanded, scaling_, 3, nullptr, false, policy);
     const int64_t attn_out_dim = static_cast<int64_t>(num_heads_) * head_dim_;
@@ -218,6 +294,27 @@ Tensor DFlashDecoderLayer::forward(const Tensor& target_hidden,
     return attn_residual + mlp_out;
 }
 
+std::pair<Tensor, Tensor> DFlashDecoderLayer::build_context_kv(const Tensor& context_hidden,
+                                                               const Tensor& rope_cos,
+                                                               const Tensor& rope_sin) const {
+    // context_hidden does NOT go through input_layernorm (it's a separate path).
+    return self_attn_.build_context_kv(context_hidden, rope_cos, rope_sin);
+}
+
+Tensor DFlashDecoderLayer::forward_with_cached_kv(const Tensor& hidden_states,
+                                                  const Tensor& context_k,
+                                                  const Tensor& context_v,
+                                                  const Tensor& rope_cos,
+                                                  const Tensor& rope_sin) const {
+    auto residual = hidden_states;
+    auto normed = input_layernorm_.forward(hidden_states);
+    auto attn_out = self_attn_.forward_with_cached_kv(normed, context_k, context_v, rope_cos, rope_sin);
+    auto attn_residual = residual + attn_out;
+    auto post_norm = post_attention_layernorm_.forward(attn_residual);
+    auto mlp_out = mlp_.forward(post_norm);
+    return attn_residual + mlp_out;
+}
+
 DFlashDraftModel::DFlashDraftModel(BuilderContext& ctx, const DFlashDraftConfig& cfg, Module* parent)
     : Module("", ctx, parent),
       cfg_(cfg),
@@ -250,6 +347,73 @@ Tensor DFlashDraftModel::forward(const Tensor& target_hidden,
     auto cos_sin = ops::llm::rope_cos_sin(position_ids, head_dim_, rope_theta_, policy);
     for (const auto& layer : layers_) {
         hidden_states = layer.forward(context_hidden, hidden_states, cos_sin.first, cos_sin.second);
+    }
+    return norm_.forward(hidden_states);
+}
+
+std::vector<std::pair<Tensor, Tensor>> DFlashDraftModel::build_context_kv(
+    const Tensor& target_hidden,
+    const Tensor& position_ids) const {
+    auto* policy = &ctx().op_policy();
+    auto conditioned = ops::linear(target_hidden, fc_weight());
+    auto context_hidden = hidden_norm_.forward(conditioned);
+    auto cos_sin = ops::llm::rope_cos_sin(position_ids, head_dim_, rope_theta_, policy);
+
+    // ── Batched KV projection (SGLang-inspired) ──
+    // Stack all K,V weights: [k_w0, v_w0, k_w1, v_w1, ...] along dim 0.
+    // Single large MatMul replaces 2*num_layers separate MatMuls.
+    const int32_t kv_dim = layers_[0].attn().kv_dim();
+    const int32_t num_layers = static_cast<int32_t>(layers_.size());
+
+    std::vector<Tensor> all_kv_weights;
+    all_kv_weights.reserve(static_cast<size_t>(num_layers) * 2);
+    for (const auto& layer : layers_) {
+        all_kv_weights.push_back(layer.attn().get_k_proj_weight());
+        all_kv_weights.push_back(layer.attn().get_v_proj_weight());
+    }
+    // batched_weight: [num_layers * 2 * kv_dim, hidden_size]
+    auto batched_weight = ops::concat(all_kv_weights, 0);
+
+    // Single MatMul: context_hidden[1,A,H] × batched_weight^T → [1,A, num_layers*2*kv_dim]
+    auto all_kv = ops::linear(context_hidden, batched_weight);
+
+    // Slice per-layer K,V and apply post-processing (reshape + KNorm + RoPE).
+    std::vector<std::pair<Tensor, Tensor>> kv_pairs;
+    kv_pairs.reserve(layers_.size());
+    for (int32_t i = 0; i < num_layers; ++i) {
+        const int64_t k_start = static_cast<int64_t>(i) * 2 * kv_dim;
+        const int64_t v_start = k_start + kv_dim;
+        const int64_t v_end = v_start + kv_dim;
+
+        auto k_proj = ops::slice(all_kv, k_start, v_start, 1, 2);   // [1,A,kv_dim]
+        auto v_proj = ops::slice(all_kv, v_start, v_end, 1, 2);     // [1,A,kv_dim]
+
+        // Add bias if present (rare, but handle for completeness).
+        if (layers_[i].attn().has_kv_bias()) {
+            const auto* k_bias = layers_[i].attn().get_k_proj_bias();
+            const auto* v_bias = layers_[i].attn().get_v_proj_bias();
+            if (k_bias) k_proj = k_proj + *k_bias;
+            if (v_bias) v_proj = v_proj + *v_bias;
+        }
+
+        kv_pairs.push_back(layers_[i].attn().post_process_context_kv(
+            k_proj, v_proj, cos_sin.first, cos_sin.second));
+    }
+    return kv_pairs;
+}
+
+Tensor DFlashDraftModel::forward_with_cached_kv(
+    const Tensor& noise_embedding,
+    const Tensor& position_ids,
+    const std::vector<std::pair<Tensor, Tensor>>& context_kv) const {
+    auto hidden_states = noise_embedding;
+    auto* policy = &ctx().op_policy();
+    auto cos_sin = ops::llm::rope_cos_sin(position_ids, head_dim_, rope_theta_, policy);
+
+    for (size_t i = 0; i < layers_.size(); ++i) {
+        hidden_states = layers_[i].forward_with_cached_kv(
+            hidden_states, context_kv[i].first, context_kv[i].second,
+            cos_sin.first, cos_sin.second);
     }
     return norm_.forward(hidden_states);
 }

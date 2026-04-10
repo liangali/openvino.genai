@@ -676,7 +676,9 @@ int main(int argc, char* argv[]) try {
     }
     std::cout << std::endl;
     ov::genai::Tokenizer tokenizer(target_dir);
-    const int64_t mask_token_id = resolve_mask_token_id(tokenizer);
+    const int64_t mask_token_id = (draft_cfg.mask_token_id > 0)
+                                     ? draft_cfg.mask_token_id
+                                     : resolve_mask_token_id(tokenizer);
     const int64_t eos_token_id = tokenizer.get_eos_token_id();
     std::cout << "[DEBUG] mask_token_id=" << mask_token_id << " eos_token_id=" << eos_token_id << std::endl;
 

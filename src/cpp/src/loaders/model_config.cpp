@@ -386,7 +386,13 @@ ModelConfig ModelConfig::from_hf_json(const std::filesystem::path& config_path) 
     // DFlash-specific
     config.block_size = extract_json_int(json, "block_size", 0);
     config.num_target_layers = extract_json_int(json, "num_target_layers", 0);
-    
+    {
+        auto dflash_json = extract_json_object(json, "dflash_config");
+        if (!dflash_json.empty()) {
+            config.mask_token_id = static_cast<int64_t>(extract_json_int(dflash_json, "mask_token_id", -1));
+        }
+    }
+
     // Normalization
     config.rms_norm_eps = extract_json_float(dims_json, "rms_norm_eps", 1e-6f);
     

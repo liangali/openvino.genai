@@ -41,6 +41,14 @@
 #include "modeling/weights/synthetic_weight_source.hpp"
 #include "sampling/logit_processor.hpp"
 
+#ifdef _WIN32
+#  define NOMINMAX
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#  include <shellapi.h>   // CommandLineToArgvW
+#  pragma comment(lib, "shell32.lib")
+#endif
+
 namespace {
 
 struct SampleOptions {
@@ -649,14 +657,7 @@ ov::Tensor make_zero_tensor(const ov::element::Type& type, const ov::Shape& shap
     return tensor;
 }
 
-// ---------------------------------------------------------------------------
-// USM-host tensor helpers — iGPU zero-copy optimization
-// ---------------------------------------------------------------------------
-// On iGPU, GPU can access USM-host memory directly without H2D copy.
-// This eliminates the costly wait_for_events overhead for each input tensor.
-// Falls back to standard ov::Tensor when the context doesn't support it.
 
-/// Try to get the GPU RemoteContext from a CompiledModel.
 std::optional<ov::RemoteContext> try_get_gpu_context(ov::CompiledModel& compiled) {
     try {
         return compiled.get_context();
@@ -787,6 +788,25 @@ ov::Tensor make_dummy_image() {
 }  // namespace
 
 int main(int argc, char* argv[]) try {
+#ifdef _WIN32
+    // On Windows, argv is encoded in the system ANSI codepage (e.g. GBK),
+    // which corrupts non-ASCII characters like curly quotes and em dashes.
+    // Use the native wide-char command line and convert to UTF-8.
+    int wargc = 0;
+    wchar_t** wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+    std::vector<std::string> utf8_args(wargc);
+    std::vector<char*> utf8_argv(wargc);
+    for (int i = 0; i < wargc; ++i) {
+        int len = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, nullptr, 0, nullptr, nullptr);
+        utf8_args[i].resize(len - 1);  // len includes null terminator
+        WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, utf8_args[i].data(), len, nullptr, nullptr);
+        utf8_argv[i] = utf8_args[i].data();
+    }
+    LocalFree(wargv);
+    argc = wargc;
+    argv = utf8_argv.data();
+#endif
+
     if (argc == 1) {
         print_usage(argv[0]);
         return 0;
@@ -1185,11 +1205,6 @@ int main(int argc, char* argv[]) try {
                                                        tokenizer.get());
 
     ov::Tensor step_ids = make_usm_host_tensor(gpu_ctx, ov::element::i64, {batch, 1});
-    ov::Tensor step_mask = make_usm_host_tensor(gpu_ctx, ov::element::i64, {batch, 1});
-    auto* step_mask_data = step_mask.data<int64_t>();
-    for (size_t b = 0; b < batch; ++b) {
-        step_mask_data[b] = 1;
-    }
 
     ov::Tensor decode_visual;
     ov::Tensor decode_visual_mask;
@@ -1231,9 +1246,6 @@ int main(int argc, char* argv[]) try {
             }
         }
     }
-    // Pre-allocate USM-host tensor for decode position_ids - reuse across steps
-    // to avoid per-step create_host_tensor() + memcpy overhead.
-    // Shape: [3, batch, 1] (3 planes of identical position values per batch element)
     ov::Tensor usm_decode_pos = make_usm_host_tensor(gpu_ctx, ov::element::i64, {3, batch, 1});
     const int64_t* rope_deltas_data = plan.rope_deltas.data<const int64_t>();
 
@@ -1255,6 +1267,16 @@ int main(int argc, char* argv[]) try {
             pos_data[b] = value;             // plane 0
             pos_data[batch + b] = value;     // plane 1
             pos_data[2 * batch + b] = value; // plane 2
+        }
+
+        // Build full-length attention_mask: {batch, past_len + 1} all-ones.
+        // The stateful model needs the mask to reflect the total attended sequence length
+        // (KV cache entries + current token), not just a single [1].
+        const size_t total_seq = static_cast<size_t>(past_len) + 1;
+        ov::Tensor step_mask(ov::element::i64, {batch, total_seq});
+        auto* mask_ptr = step_mask.data<int64_t>();
+        for (size_t i = 0; i < batch * total_seq; ++i) {
+            mask_ptr[i] = 1;
         }
 
         text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kInputIds, step_ids);
