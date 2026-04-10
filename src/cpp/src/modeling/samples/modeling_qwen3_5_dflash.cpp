@@ -762,15 +762,12 @@ int main(int argc, char* argv[]) try {
 
         auto draft_start = Clock::now();
 
-        // Draft position_ids (2D): [0..T-1, T-1..T+B-2] — context + draft with overlap
         const size_t total_pos = target_hidden_len + block_ids.size();
         ov::Tensor draft_pos(ov::element::i64, {1, total_pos});
         {
             auto* pd = draft_pos.data<int64_t>();
-            for (size_t i = 0; i < target_hidden_len; ++i)
+            for (size_t i = 0; i < total_pos; ++i)
                 pd[i] = static_cast<int64_t>(i);
-            for (size_t i = target_hidden_len; i < total_pos; ++i)
-                pd[i] = static_cast<int64_t>(target_hidden_len - 1 + (i - target_hidden_len));
         }
 
         // Run combined draft model (embed + draft + lm_head in one GPU dispatch)
