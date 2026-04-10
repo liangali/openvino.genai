@@ -197,8 +197,8 @@ Tensor Qwen3_5Attention::forward(const Tensor& hidden_states,
                                    const Tensor& beam_idx,
                                    const Tensor& rope_cos,
                                    const Tensor& rope_sin,
-                                   const Tensor* attention_mask,
-                                   const Tensor* precomputed_sdpa_mask) const {
+                                   const Tensor* /*attention_mask*/,
+                                   const Tensor* /*precomputed_sdpa_mask*/) const {
     auto* policy = &ctx().op_policy();
     auto* op_ctx = hidden_states.context();
 
@@ -223,14 +223,7 @@ Tensor Qwen3_5Attention::forward(const Tensor& hidden_states,
     auto k_expanded = ops::llm::repeat_kv(cached.first, num_heads_, num_kv_heads_, head_dim_);
     auto v_expanded = ops::llm::repeat_kv(cached.second, num_heads_, num_kv_heads_, head_dim_);
 
-    const Tensor* sdpa_mask = precomputed_sdpa_mask;
-    std::optional<Tensor> local_mask;
-    if (!sdpa_mask) {
-        local_mask = attention_mask ? ops::llm::build_kv_causal_mask_with_attention(q_heads, cached.first, *attention_mask)
-                                    : ops::llm::build_kv_causal_mask(q_heads, cached.first);
-        sdpa_mask = &(*local_mask);
-    }
-    auto attn = ops::llm::sdpa(q_heads, k_expanded, v_expanded, scaling_, 3, sdpa_mask, false, policy);
+    auto attn = ops::llm::sdpa(q_heads, k_expanded, v_expanded, scaling_, 3, nullptr, true, policy);
 
     const int64_t attn_hidden = static_cast<int64_t>(num_heads_) * static_cast<int64_t>(head_dim_);
     auto merged = attn.permute({0, 2, 1, 3}).reshape({0, 0, attn_hidden});
@@ -536,7 +529,7 @@ Tensor Qwen3_5GatedDeltaNet::forward(const Tensor& hidden_states,
         // No ReadValue/Assign — LinearAttention manages the variable exclusively.
         // The GPU impl reads from variable memory (if set) or from recurrent_init (first iteration),
         // and writes updated state directly to variable memory.
-        auto la_result = ops::linear_attention(q_f32, k_f32, v_f32, beta, g, recurrent_init, recurrent_var);
+        auto la_result = ops::linear_attention(q_heads, k_heads, v_heads, beta, g, recurrent_init, recurrent_var);
         core_attn_tensor = la_result.first;   // [B, S, num_v_heads, head_v_dim]
     } else {
         // ── TensorIterator path (default) ──
@@ -807,10 +800,6 @@ Tensor Qwen3_5Model::forward_impl(const Tensor* input_ids,
     auto cos_sin = build_mrope_cos_sin(position_ids);
     const Tensor& seq_source = inputs_embeds ? *inputs_embeds : *input_ids;
     auto* op_ctx = seq_source.context();
-    auto q_len_1d = Tensor(shape::dim(seq_source, 1), op_ctx);
-    auto shared_full_attn_sdpa_mask =
-        ops::llm::build_kv_causal_mask_with_attention_from_q_len(q_len_1d, full_attention_mask);
-
     std::optional<Tensor> linear_mask_view;
     const Tensor* linear_mask = nullptr;
     if (linear_attention_mask) {
@@ -833,11 +822,11 @@ Tensor Qwen3_5Model::forward_impl(const Tensor* input_ids,
                                  beam_idx,
                                  cos_sin.first,
                                  cos_sin.second,
-                                 &full_attention_mask,
+                                 nullptr,
                                  linear_mask,
                                  cache_position,
                                  residual,
-                                 &shared_full_attn_sdpa_mask);
+                                 nullptr);
         hidden_states = out.first;
         residual = out.second;
     }
@@ -916,7 +905,10 @@ Tensor Qwen3_5ForCausalLM::forward(const Tensor& input_ids,
                                  cache_position,
                                  visual_embeds,
                                  visual_pos_mask);
-    return lm_head_.forward(hidden);
+    // Select only the last token before the LM head to avoid materializing
+    // the full [seq, vocab] logits tensor (e.g. 9907 × 248320 × 4B = 9.2 GB).
+    auto last_hidden = ops::slice(hidden, -1, std::numeric_limits<int64_t>::max(), 1, 1);
+    return lm_head_.forward(last_hidden);
 }
 
 Tensor Qwen3_5ForCausalLM::forward_embeds(const Tensor& inputs_embeds,
@@ -935,7 +927,8 @@ Tensor Qwen3_5ForCausalLM::forward_embeds(const Tensor& inputs_embeds,
                                         cache_position,
                                         visual_embeds,
                                         visual_pos_mask);
-    return lm_head_.forward(hidden);
+    auto last_hidden = ops::slice(hidden, -1, std::numeric_limits<int64_t>::max(), 1, 1);
+    return lm_head_.forward(last_hidden);
 }
 
 std::shared_ptr<ov::Model> create_qwen3_5_text_model(
