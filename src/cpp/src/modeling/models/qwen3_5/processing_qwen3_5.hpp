@@ -56,6 +56,7 @@ struct Qwen3_5TextConfig {
     bool norm_topk_prob = true;
     bool output_router_logits = false;
     float router_aux_loss_coef = 0.0f;
+    int32_t mtp_num_hidden_layers = 0;   // 0 = MTP disabled; 1 for Qwen3.5-2B and 35B-A3B
     Qwen3_5RopeConfig rope;
 
     int32_t kv_heads() const;

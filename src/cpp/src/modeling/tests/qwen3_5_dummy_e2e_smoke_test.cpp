@@ -80,7 +80,7 @@ TEST(Qwen3_5DummyE2E, VisionToTextPrefillDecodeSmoke) {
     tests::DummyWeightFinalizer finalizer;
 
     auto vision_model = ov::genai::modeling::models::create_qwen3_5_vision_model(cfg, source, finalizer);
-    auto text_model = ov::genai::modeling::models::create_qwen3_5_text_model(cfg, source, finalizer, false, true);
+    auto text_model = ov::genai::modeling::models::create_qwen3_5_text_model(cfg, source, finalizer, false, true, false);
 
     ov::Core core;
     auto compiled_vision = core.compile_model(vision_model, "GPU");

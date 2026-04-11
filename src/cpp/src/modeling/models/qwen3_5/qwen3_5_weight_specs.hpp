@@ -16,6 +16,7 @@ namespace models {
 std::vector<ov::genai::modeling::weights::SyntheticWeightSpec> build_qwen3_5_text_weight_specs(const Qwen3_5TextConfig& cfg);
 std::vector<ov::genai::modeling::weights::SyntheticWeightSpec> build_qwen3_5_vision_weight_specs(const Qwen3_5VisionConfig& cfg);
 std::vector<ov::genai::modeling::weights::SyntheticWeightSpec> build_qwen3_5_vlm_weight_specs(const Qwen3_5Config& cfg);
+std::vector<ov::genai::modeling::weights::SyntheticWeightSpec> build_qwen3_5_mtp_weight_specs(const Qwen3_5TextConfig& cfg);
 
 }  // namespace models
 }  // namespace modeling
