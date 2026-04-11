@@ -37,6 +37,8 @@
 #include "modeling/models/qwen3_5/modeling_qwen3_5_vision.hpp"
 #include "modeling/models/qwen3_5/processing_qwen3_5.hpp"
 #include "modeling/models/qwen3_5/qwen3_5_weight_specs.hpp"
+#include "modeling/models/qwen3_5/mtp_draft_runner.hpp"
+#include "modeling/models/qwen3_5/modeling_qwen3_5_mtp.hpp"
 #include "modeling/weights/quantization_config.hpp"
 #include "modeling/weights/synthetic_weight_source.hpp"
 #include "sampling/logit_processor.hpp"
@@ -52,6 +54,8 @@ struct SampleOptions {
     std::string device = "GPU";
     int max_new_tokens = 64;
     bool cache_model = false;
+    bool enable_mtp = false;
+    int mtp_draft_n = 1;  // draft tokens per super-step; requires --mtp; default=1 (phase-1 compat)
 
     std::string dummy_model = "dense";
 
@@ -273,6 +277,10 @@ SampleOptions parse_cli(int argc, char* argv[]) {
         } else if (arg == "--think") {
             int val = parse_i32(take_value("--think"), "--think");
             opts.enable_thinking = (val != 0);
+        } else if (arg == "--mtp") {
+            opts.enable_mtp = true;
+        } else if (arg == "--mtp-draft-n") {
+            opts.mtp_draft_n = parse_i32(take_value("--mtp-draft-n"), "--mtp-draft-n");
         } else {
             throw std::runtime_error("Unknown option: " + arg);
         }
@@ -880,10 +888,13 @@ int main(int argc, char* argv[]) try {
         text_ir_stem += "_l" + std::to_string(*opts.num_layers);
     }
     std::string vision_ir_stem = "qwen3_5_vision" + quant_cache_suffix(vision_quant_config);
+    const std::string mtp_ir_stem = "qwen3_5_mtp" + quant_cache_suffix(text_quant_config);
     const auto text_xml_path = ir_dir / (text_ir_stem + ".xml");
     const auto text_bin_path = ir_dir / (text_ir_stem + ".bin");
     const auto vision_xml_path = ir_dir / (vision_ir_stem + ".xml");
     const auto vision_bin_path = ir_dir / (vision_ir_stem + ".bin");
+    const auto mtp_xml_path = ir_dir / (mtp_ir_stem + ".xml");
+    const auto mtp_bin_path = ir_dir / (mtp_ir_stem + ".bin");
 
     const bool load_text_from_ir = opts.cache_model && !use_dummy_mode_flag && has_ir_model_pair(text_xml_path, text_bin_path);
     const bool load_vision_from_ir =
@@ -944,6 +955,7 @@ int main(int argc, char* argv[]) try {
     if (load_text_from_ir) {
         std::cout << "[cache-model] Reusing cached text IR: " << text_xml_path << std::endl;
         text_model = core.read_model(text_xml_path.string(), text_bin_path.string());
+        std::cout << "[cache-model] read_model done, nodes=" << text_model->get_ops().size() << std::endl;
         if (use_vl && !is_vl_text_ir_compatible(text_model)) {
             std::cout << "[cache-model] Cached text IR is not VL-compatible (missing visual inputs), rebuilding: "
                       << text_xml_path << std::endl;
@@ -953,16 +965,31 @@ int main(int argc, char* argv[]) try {
     if (!text_model) {
         auto& weight_source = ensure_weight_source();
         ov::genai::safetensors::SafetensorsWeightFinalizer text_finalizer(text_quant_config);
+        const bool output_hidden_states = cfg.text.mtp_num_hidden_layers > 0 && !use_vl;
         text_model = ov::genai::modeling::models::create_qwen3_5_text_model(
             cfg,
             weight_source,
             text_finalizer,
             false,
-            use_vl);
+            use_vl,
+            output_hidden_states);
         if (opts.cache_model) {
             ov::serialize(text_model, text_xml_path.string(), text_bin_path.string());
             std::cout << "[cache-model] Saved text IR: " << text_xml_path << std::endl;
         }
+    }
+
+    // Verify hidden_states output is present when config requires it.
+    // Runs after both the cached-IR path and the weight-rebuild path so stale
+    // caches (built without output_hidden_states=true) are caught immediately.
+    if (cfg.text.mtp_num_hidden_layers > 0 && !use_vl) {
+        bool has_hs = false;
+        for (const auto& out : text_model->outputs()) {
+            if (out.get_any_name() == "hidden_states") { has_hs = true; break; }
+        }
+        OPENVINO_ASSERT(has_hs,
+            "hidden_states output missing from text model — "
+            "delete the cached qwen3_5_text*.xml/.bin and retry");
     }
 
     if (use_dummy_mode_flag && source) {
@@ -981,6 +1008,7 @@ int main(int argc, char* argv[]) try {
         std::cout << "[vision] Compiling vision model on device: " << vision_device << std::endl;
         compiled_vision = core.compile_model(vision_model, vision_device);
     }
+    std::cout << "[cache-model] starting compile_model" << std::endl;
     auto compiled_text = core.compile_model(text_model, opts.device);
 
     ov::Tensor visual_embeds;
@@ -1021,6 +1049,38 @@ int main(int argc, char* argv[]) try {
         if (use_dummy_mode_flag && source) {
             source->release_all_cached_tensors();
             source.reset();
+        }
+    }
+
+    // MTP: build draft model from weights on first run; reload from cached IR on second run.
+    // Only active when --mtp is explicitly passed, for --mode text (not vl), and config declares MTP layers.
+    const bool try_mtp = !use_vl
+                      && opts.enable_mtp
+                      && !use_dummy_mode_flag
+                      && cfg.text.mtp_num_hidden_layers > 0;
+    std::optional<ov::CompiledModel> compiled_mtp;
+    if (try_mtp) {
+        std::shared_ptr<ov::Model> mtp_ov_model;
+        const bool load_mtp_from_ir = opts.cache_model && has_ir_model_pair(mtp_xml_path, mtp_bin_path);
+        if (load_mtp_from_ir) {
+            std::cout << "[cache-model] Reusing cached MTP IR: " << mtp_xml_path << std::endl;
+            mtp_ov_model = core.read_model(mtp_xml_path.string(), mtp_bin_path.string());
+        } else {
+            auto& weight_source = ensure_weight_source();
+            ov::genai::safetensors::SafetensorsWeightFinalizer mtp_finalizer(text_quant_config);
+            mtp_ov_model = ov::genai::modeling::models::create_qwen3_5_mtp_model(cfg, weight_source, mtp_finalizer);
+            if (opts.cache_model) {
+                ov::serialize(mtp_ov_model, mtp_xml_path.string(), mtp_bin_path.string());
+                std::cout << "[cache-model] Saved MTP IR: " << mtp_xml_path << std::endl;
+            }
+        }
+        try {
+            compiled_mtp = core.compile_model(mtp_ov_model, opts.device);
+            std::cout << "[MTP] Draft model compiled on " << opts.device << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "[MTP] Warning: failed to compile MTP model (" << e.what()
+                      << "), falling back to single-token." << std::endl;
+            compiled_mtp.reset();
         }
     }
 
@@ -1114,6 +1174,14 @@ int main(int argc, char* argv[]) try {
 
     auto beam_idx = make_beam_idx(batch);
     auto text_request = compiled_text.create_infer_request();
+
+    // Construct MTP runner (holds non-owning ref to text_request)
+    std::unique_ptr<ov::genai::MtpDraftRunner> mtp_runner;
+    if (compiled_mtp) {
+        auto mtp_infer_req = compiled_mtp->create_infer_request();
+        mtp_runner = std::make_unique<ov::genai::MtpDraftRunner>(
+            std::move(mtp_infer_req), text_request);
+    }
 
     // Get GPU context for USM-host tensors (iGPU zero-copy optimization)
     auto gpu_ctx = try_get_gpu_context(compiled_text);
@@ -1239,6 +1307,132 @@ int main(int argc, char* argv[]) try {
 
     size_t decode_steps = 0;
     const auto decode_start = std::chrono::steady_clock::now();
+    // MTP speculative decode is greedy-only. Bypass if sampling is active or
+    // no MTP runner was constructed. Penalties are intentionally skipped in the
+    // MTP path (consistent with MtpSpeculativeLLMPipeline); use --no-mtp if
+    // repetition/frequency/presence penalties are required.
+    if (mtp_runner && !use_sampling) {
+        // run_main_step: set step_ids/position_ids, call text_request.infer(),
+        // advance past_len, return argmax of logits.
+        // Captures logits and logit_buf from outer scope by reference — do NOT
+        // declare a new local 'logits' inside this block.
+        auto run_main_step = [&](int64_t token) -> int64_t {
+            auto* step_data = step_ids.data<int64_t>();
+            for (size_t b = 0; b < batch; ++b) step_data[b] = token;
+
+            auto* pos_data = usm_decode_pos.data<int64_t>();
+            for (size_t b = 0; b < batch; ++b) {
+                const int64_t value = past_len + rope_deltas_data[b];
+                pos_data[b] = value;
+                pos_data[batch + b] = value;
+                pos_data[2 * batch + b] = value;
+            }
+
+            text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kInputIds,      step_ids);
+            text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kAttentionMask, step_mask);
+            text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kPositionIds,   usm_decode_pos);
+            text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kBeamIdx,       usm_beam_idx);
+            text_request.infer();
+
+            // Reassigns the outer 'logits' variable (captured by ref from line ~1166)
+            logits = text_request.get_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kLogits);
+            extract_last_logits_f32(logits, logit_buf);
+            past_len += 1;
+            return argmax_f32(logit_buf);
+        };
+
+        const int N = opts.mtp_draft_n;
+        int64_t mtp_prefix_token = -1;  // -1 = no pending KV sync; token IDs are non-negative
+        size_t accept_count = 0, reject_count = 0;
+
+        // Prefill hidden_states has shape [1, prompt_len, H].
+        // Inject the last token's slice so the first draft_n call gets a single-token
+        // hidden state — not the full prefill sequence.
+        {
+            const ov::Tensor raw_hs = text_request.get_tensor("hidden_states");
+            mtp_runner->inject_hidden_state_slice(raw_hs, raw_hs.get_shape()[1] - 1);
+        }
+
+        while (generated.size() < static_cast<size_t>(opts.max_new_tokens)) {
+            if (!stop_token_ids.empty() && stop_token_ids.count(next_id) > 0) break;
+
+            // [0] KV sync (deferred full-accept from previous super-step).
+            // After full accept: main KV = past_len, MTP KV = past_len - 1.
+            // infer_next at position past_len-1 advances MTP KV to past_len.
+            // Reads hidden_states live from text_request (last run_main_step output).
+            if (mtp_prefix_token >= 0) {
+                mtp_runner->infer_next(mtp_prefix_token, past_len - 1);
+                mtp_prefix_token = -1;
+            }
+
+            // [1] DRAFT PHASE: draft N tokens sequentially via MTP
+            const std::vector<int64_t> drafts = mtp_runner->draft_n(next_id, past_len, N);
+
+            // [2] VERIFY PHASE: sequential single-token passes (M=1, same fast path as
+            // non-MTP decode). No GDA contamination — each step advances GDA state by
+            // exactly one token in the correct sequence order, so no save/restore needed.
+            //
+            // Verify [next_id, drafts[0], ..., drafts[N-1]] one token at a time, stopping
+            // at the first mismatch. On full accept, run one extra pass to get the bonus token.
+            int j = N;  // first mismatch index; N means full accept
+            std::vector<int64_t> refs;
+            refs.reserve(static_cast<size_t>(N + 1));
+            int64_t token_to_verify = next_id;
+            for (int k = 0; k <= N; ++k) {
+                const int64_t ref_k = run_main_step(token_to_verify);
+                refs.push_back(ref_k);
+                if (k < N) {
+                    if (ref_k != drafts[k]) { j = k; break; }
+                    token_to_verify = drafts[k];
+                }
+            }
+            // refs[0..j]: j+1 entries. refs[j] is correction (j<N) or bonus token (j==N).
+            // past_len incremented by j+1 inside run_main_step calls.
+
+            // [3] ACCEPT / REJECT: emit accepted draft tokens then correction/bonus
+            bool done = false;
+            for (int k = 0; k < j; ++k) {
+                if (generated.size() >= static_cast<size_t>(opts.max_new_tokens)) { done = true; break; }
+                generated.push_back(drafts[k]);
+                ++decode_steps;
+                ++accept_count;
+                if (!stop_token_ids.empty() && stop_token_ids.count(drafts[k]) > 0) { done = true; break; }
+            }
+            if (!done && generated.size() < static_cast<size_t>(opts.max_new_tokens)) {
+                generated.push_back(refs[j]);
+                ++decode_steps;
+                if (j < N) ++reject_count;
+            }
+            next_id = refs[j];
+
+            // [4] MTP KV STATE MANAGEMENT
+            // Main KV is already correct (sequential passes added exactly j+1 tokens).
+            // MTP KV: draft_n added N entries; we keep j+1 entries → trim N-j-1.
+            if (j < N) {
+                if (N - j - 1 > 0)
+                    mtp_runner->trim_kv_cache(static_cast<size_t>(N - j - 1));
+                // Stage hidden state from last run_main_step for next draft_n.
+                // After sequential verify, text_request's "hidden_states" output is [1,1,H]
+                // (the hidden state at position past_len-1 = P+j).
+                const ov::Tensor last_hs = text_request.get_tensor("hidden_states");
+                mtp_runner->inject_hidden_state_slice(last_hs, 0);
+            } else {
+                // Full accept: defer MTP KV sync to next iteration's step [0].
+                // text_request's "hidden_states" still holds h[P+N] from last run_main_step;
+                // infer_next in step [0] reads it via main_runner_ref_.
+                mtp_prefix_token = drafts[N - 1];
+            }
+
+            if (done) break;
+        }
+
+        if (accept_count + reject_count > 0) {
+            std::cout << "[MTP] Accept rate: " << accept_count
+                      << "/" << (accept_count + reject_count)
+                      << " = " << (100.0 * accept_count / (accept_count + reject_count))
+                      << "%" << std::endl;
+        }
+    } else {
     for (int step = 1; step < opts.max_new_tokens; ++step) {
         if (!stop_token_ids.empty() && stop_token_ids.count(next_id) > 0) {
             break;
@@ -1283,6 +1477,7 @@ int main(int argc, char* argv[]) try {
         decode_steps += 1;
         past_len += 1;
     }
+    }       // closes the `else {` block opened above
     const auto decode_end = std::chrono::steady_clock::now();
 
     const double ttft_ms = elapsed_ms(prefill_start, prefill_end);

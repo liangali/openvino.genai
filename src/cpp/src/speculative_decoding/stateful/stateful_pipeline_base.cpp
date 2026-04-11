@@ -20,6 +20,10 @@ StatefulSpeculativePipelineBase::StatefulSpeculativePipelineBase(const Tokenizer
                                                                  const GenerationConfig& generation_config)
     : LLMPipelineImplBase(tokenizer, generation_config) {
     m_sd_perf_metrics = SDPerModelsPerfMetrics();
+    // Ensure eos_token_id is populated from the tokenizer if not set in the generation config.
+    if (m_generation_config.eos_token_id == -1) {
+        m_generation_config.set_eos_token_id(m_tokenizer.get_eos_token_id());
+    }
 }
 
 void StatefulSpeculativePipelineBase::ensure_num_assistant_tokens_is_set(GenerationConfig& config) {

@@ -80,6 +80,7 @@ void parse_text_config(const nlohmann::json& data, ov::genai::modeling::models::
     read_json_param(data, "norm_topk_prob", cfg.norm_topk_prob);
     read_json_param(data, "output_router_logits", cfg.output_router_logits);
     read_json_param(data, "router_aux_loss_coef", cfg.router_aux_loss_coef);
+    read_json_param(data, "mtp_num_hidden_layers", cfg.mtp_num_hidden_layers);
 
     if (data.contains("rope_scaling")) {
         parse_rope_config(data.at("rope_scaling"), cfg.rope);

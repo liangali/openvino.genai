@@ -81,7 +81,7 @@ TEST(Qwen3_5CacheRuntime, TrimsOnlyAttentionStatesAndKeepsLinearStates) {
     ov::genai::modeling::weights::SyntheticWeightSource source(std::move(specs), 3001u, -0.02f, 0.02f);
     tests::DummyWeightFinalizer finalizer;
 
-    auto text_model = ov::genai::modeling::models::create_qwen3_5_text_model(cfg, source, finalizer, false, false);
+    auto text_model = ov::genai::modeling::models::create_qwen3_5_text_model(cfg, source, finalizer, false, false, false);
     ov::Core core;
     auto compiled = core.compile_model(text_model, "GPU");
     auto request = compiled.create_infer_request();

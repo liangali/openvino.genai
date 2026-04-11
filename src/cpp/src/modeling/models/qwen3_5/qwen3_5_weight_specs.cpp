@@ -203,6 +203,86 @@ std::vector<ov::genai::modeling::weights::SyntheticWeightSpec> build_qwen3_5_vlm
     return specs;
 }
 
+std::vector<ov::genai::modeling::weights::SyntheticWeightSpec>
+build_qwen3_5_mtp_weight_specs(const Qwen3_5TextConfig& cfg_in) {
+    auto cfg = cfg_in;
+    cfg.finalize();
+    cfg.validate();
+    const bool is_moe = cfg.is_moe_enabled();
+
+    const size_t H       = to_sz(cfg.hidden_size, "hidden_size");
+    const size_t V       = to_sz(cfg.vocab_size, "vocab_size");
+    const size_t nh      = to_sz(cfg.num_attention_heads, "num_attention_heads");
+    const size_t nkv     = to_sz(cfg.kv_heads(), "num_key_value_heads");
+    const size_t hd      = to_sz(cfg.resolved_head_dim(), "head_dim");
+    // q_proj is gated (attn_output_gate=true applies to MTP layer as well)
+    const size_t q_proj_out = nh * hd * 2;
+    const size_t kv_proj_out = nkv * hd;
+
+    const size_t inter    = is_moe ? 0 : to_sz(cfg.intermediate_size, "intermediate_size");
+    const size_t moe_inter = is_moe ? to_sz(cfg.moe_intermediate_size, "moe_intermediate_size") : 0;
+    const size_t sh_inter  = is_moe ? to_sz(cfg.shared_expert_intermediate_size, "shared_expert_intermediate_size") : 0;
+    const size_t nexp      = is_moe ? to_sz(cfg.num_experts, "num_experts") : 0;
+
+    std::vector<Spec> specs;
+
+    // Embedding table — always needed by the MTP graph.
+    // When mtp_use_dedicated_embeddings=false the MTP graph reuses the main
+    // model embedding weights; the loader handles the remapping.
+    // Checkpoint key: "model.language_model.embed_tokens.weight"
+    // Remapped to "mtp.embed_tokens.weight" via PackedMapping in create_qwen3_5_mtp_model().
+    add(specs, "model.language_model.embed_tokens.weight", {V, H});
+
+    // Projection norms and fusion FC (always present regardless of dedicated embeddings)
+    add(specs, "mtp.pre_fc_norm_embedding.weight", {H});
+    add(specs, "mtp.pre_fc_norm_hidden.weight",    {H});
+    add(specs, "mtp.fc.weight",                    {H, 2 * H});
+
+    // MTP decoder layer (single layer at index 0 inside the mtp module)
+    add(specs, "mtp.layers.0.input_layernorm.weight",          {H});
+    add(specs, "mtp.layers.0.post_attention_layernorm.weight", {H});
+
+    // Attention — q_proj is gated ({nh*hd*2, H}), k/v are not
+    add(specs, "mtp.layers.0.self_attn.q_proj.weight", {q_proj_out, H});
+    add(specs, "mtp.layers.0.self_attn.k_proj.weight", {kv_proj_out, H});
+    add(specs, "mtp.layers.0.self_attn.v_proj.weight", {kv_proj_out, H});
+    add(specs, "mtp.layers.0.self_attn.o_proj.weight", {H, nh * hd});
+    add(specs, "mtp.layers.0.self_attn.q_norm.weight", {hd});
+    add(specs, "mtp.layers.0.self_attn.k_norm.weight", {hd});
+
+    if (is_moe) {
+        // MoE MLP weights (per-expert; no fused gate_up_proj in MTP unlike main model)
+        add(specs, "mtp.layers.0.mlp.gate.weight",               {nexp, H});
+        add(specs, "mtp.layers.0.mlp.shared_expert_gate.weight", {1, H});
+        add(specs, "mtp.layers.0.mlp.shared_expert.gate_proj.weight", {sh_inter, H});
+        add(specs, "mtp.layers.0.mlp.shared_expert.up_proj.weight",   {sh_inter, H});
+        add(specs, "mtp.layers.0.mlp.shared_expert.down_proj.weight", {H, sh_inter});
+        for (size_t e = 0; e < nexp; ++e) {
+            const std::string pfx = "mtp.layers.0.mlp.experts." + std::to_string(e) + ".";
+            add(specs, pfx + "gate_proj.weight", {moe_inter, H});
+            add(specs, pfx + "up_proj.weight",   {moe_inter, H});
+            add(specs, pfx + "down_proj.weight", {H, moe_inter});
+        }
+    } else {
+        // Dense MLP
+        add(specs, "mtp.layers.0.mlp.gate_proj.weight", {inter, H});
+        add(specs, "mtp.layers.0.mlp.up_proj.weight",   {inter, H});
+        add(specs, "mtp.layers.0.mlp.down_proj.weight", {H, inter});
+    }
+
+    // Final norm
+    add(specs, "mtp.norm.weight", {H});
+
+    // LM head — present only when tie_word_embeddings=false (e.g. 35B-A3B).
+    // When tie_word_embeddings=true (e.g. 2B) the lm_head shares the embedding
+    // table and no separate lm_head.weight tensor exists in the checkpoint.
+    if (!cfg.tie_word_embeddings) {
+        add(specs, "lm_head.weight", {V, H});
+    }
+
+    return specs;
+}
+
 }  // namespace models
 }  // namespace modeling
 }  // namespace genai
