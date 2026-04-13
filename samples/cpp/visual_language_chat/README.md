@@ -59,6 +59,7 @@ benchmark_vlm [OPTIONS]
 - `-mt, --max_new_tokens` (default: `20`): Maximal number of new tokens.
 - `-n, --num_iter` (default: `3`): Number of iterations.
 - `-d, --device` (default: `"CPU"`): Device to run the model on.
+- `--enable_thinking` (default: `true`): Passes Qwen-specific `enable_thinking` pipeline property when supported by the backend.
 - `-pr, --pruning_ratio`: (optional): Percentage of visual tokens to prune (valid range: 0-100); if this option is not provided, pruning is disabled.
 - `-rw, --relevance_weight` (optional): Float value from 0 to 1, controls the trade-off between diversity and relevance for visual tokens pruning; a value of 0 disables relevance weighting, while higher values (up to 1.0) emphasize relevance, making pruning more conservative on borderline tokens.
 
@@ -77,6 +78,14 @@ Embeddings preparation time: 5733.85 ± 26.34 ms
 TTFT: 11246.98 ± 80.55 ms
 TPOT: 135.45 ± 4.73 ms/token
 Throughput: 7.38 ± 0.26 tokens/s
+```
+
+To verify the Qwen3.5 VLM `enable_thinking` property path specifically, run the benchmark with `--enable_thinking false`. Before the backend fix, Qwen3.5 VLM initialization failed because this custom property leaked into OpenVINO plugin compilation. After the fix, the sample should initialize successfully and print benchmark metrics.
+
+Example:
+
+```sh
+benchmark_vlm -m /path/to/Qwen3.5-VL-35B -i /path/to/image.jpg --enable_thinking false -n 1 -nw 0
 ```
 
 For more information how performance metrics are calculated please follow [performance-metrics tutorial](../../../src/README.md#performance-metrics).

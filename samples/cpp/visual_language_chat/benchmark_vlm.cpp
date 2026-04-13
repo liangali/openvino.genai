@@ -1,12 +1,31 @@
 // Copyright (C) 2023-2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
+#include <algorithm>
+#include <cctype>
 #include <cxxopts.hpp>
 #include <filesystem>
 
 #include "load_image.hpp"
 #include <openvino/genai/visual_language/pipeline.hpp>
 #include "../text_generation/read_prompt_from_file.h"
+
+namespace {
+bool parse_bool_arg(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+
+    if (value == "1" || value == "true" || value == "yes" || value == "on") {
+        return true;
+    }
+    if (value == "0" || value == "false" || value == "no" || value == "off") {
+        return false;
+    }
+
+    throw std::runtime_error("Invalid value for --enable_thinking: " + value + ". Expected true/false, 1/0, yes/no, or on/off.");
+}
+}
 
 int main(int argc, char* argv[]) try {
     cxxopts::Options options("benchmark_vlm", "Help command");
@@ -20,6 +39,8 @@ int main(int argc, char* argv[]) try {
     ("n,num_iter", "Number of iterations", cxxopts::value<size_t>()->default_value(std::to_string(3)))
     ("mt,max_new_tokens", "Maximal number of new tokens", cxxopts::value<size_t>()->default_value(std::to_string(20)))
     ("d,device", "device", cxxopts::value<std::string>()->default_value("CPU"))
+    ("enable_thinking", "Enable Qwen thinking mode when supported by the backend", cxxopts::value<std::string>()->default_value("true"))
+    ("save_ir", "Save generated OpenVINO IRs when the model is built from source weights")
     ("pr,pruning_ratio", "(optional): Percentage of visual tokens to prune (valid range: 0-100); if this option is not provided, pruning is disabled.", cxxopts::value<size_t>())
     ("rw,relevance_weight", "(optional): Float value from 0 to 1, controls the trade-off between diversity and relevance for visual tokens pruning; a value of 0 disables relevance weighting, while higher values (up to 1.0) emphasize relevance, making pruning more conservative on borderline tokens.", cxxopts::value<float>())
     ("h,help", "Print usage");
@@ -59,6 +80,8 @@ int main(int argc, char* argv[]) try {
     std::string device = result["device"].as<std::string>();
     size_t num_warmup = result["num_warmup"].as<size_t>();
     size_t num_iter = result["num_iter"].as<size_t>();
+    const bool enable_thinking = parse_bool_arg(result["enable_thinking"].as<std::string>());
+    const bool save_ir = result.count("save_ir") > 0;
     std::vector<ov::Tensor> images = utils::load_images(image_path);
 
     ov::genai::GenerationConfig config;
@@ -69,19 +92,28 @@ int main(int argc, char* argv[]) try {
         config.relevance_weight = result["relevance_weight"].as<float>();
     }
     config.max_new_tokens = result["max_new_tokens"].as<size_t>();
+    //config.do_sample = false;
+    //config.temperature = 0.0f;
     config.ignore_eos = true;
 
     std::cout << ov::get_openvino_version() << std::endl;
+    std::cout << "enable_thinking: " << std::boolalpha << enable_thinking << std::noboolalpha << std::endl;
 
     std::unique_ptr<ov::genai::VLMPipeline> pipe;
     if (device == "NPU")
-        pipe = std::make_unique<ov::genai::VLMPipeline>(models_path, device);
+        pipe = std::make_unique<ov::genai::VLMPipeline>(models_path, device, std::pair<std::string, ov::Any>{"enable_thinking", enable_thinking}, ov::genai::enable_save_ov_model(save_ir));
     else {
         // Setting of Scheduler config will trigger usage of ContinuousBatching pipeline, which is not default for Qwen2VL, Qwen2.5VL, Gemma3 due to accuracy issues.
         ov::genai::SchedulerConfig scheduler_config;
         scheduler_config.enable_prefix_caching = false;
         scheduler_config.max_num_batched_tokens = std::numeric_limits<std::size_t>::max();
-        pipe = std::make_unique<ov::genai::VLMPipeline>(models_path, device, ov::genai::scheduler_config(scheduler_config));
+        pipe = std::make_unique<ov::genai::VLMPipeline>(
+            models_path,
+            device,
+            std::pair<std::string, ov::Any>{"enable_thinking", enable_thinking},
+            ov::genai::scheduler_config(scheduler_config),
+            ov::genai::enable_save_ov_model(save_ir)
+        );
     }
 
     auto input_data = pipe->get_tokenizer().encode(prompt);
@@ -99,6 +131,10 @@ int main(int argc, char* argv[]) try {
     }
 
     std::cout << std::fixed << std::setprecision(2);
+    std::cout << "Generated text:" << std::endl;
+    if (!res.texts.empty()) {
+        std::cout << res.texts.front() << std::endl;
+    }
     std::cout << "Output token size:" << res.perf_metrics.get_num_generated_tokens() << std::endl;
     std::cout << "Load time: " << metrics.get_load_time() << " ms" << std::endl;
     std::cout << "Generate time: " << metrics.get_generate_duration().mean << " ± " << metrics.get_generate_duration().std << " ms" << std::endl;

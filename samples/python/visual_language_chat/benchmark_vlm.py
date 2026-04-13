@@ -57,6 +57,12 @@ def main():
     parser.add_argument("-mt", "--max_new_tokens", type=int, default=20, help="Maximal number of new tokens")
     parser.add_argument("-d", "--device", type=str, default="CPU", help="Device")
     parser.add_argument(
+        "--enable_thinking",
+        type=lambda value: value.lower() in {"1", "true", "yes", "on"},
+        default=True,
+        help="Enable Qwen thinking mode when supported by the backend (true/false).",
+    )
+    parser.add_argument(
         "--pruning_ratio",
         type=ratio_type,
         default=0,
@@ -83,6 +89,7 @@ def main():
         raise RuntimeError(f'Prompt is empty!')
 
     print(f'openvino runtime version: {get_version()}, genai version: {ov_genai.__version__}')
+    print(f'enable_thinking: {args.enable_thinking}')
 
     # Perf metrics is stored in VLMDecodedResults.
     # In order to get VLMDecodedResults instead of a string input should be a list.
@@ -100,13 +107,13 @@ def main():
         config.relevance_weight = args.relevance_weight
 
     if device == "NPU":
-        pipe = ov_genai.VLMPipeline(models_path, device)
+        pipe = ov_genai.VLMPipeline(models_path, device, enable_thinking=args.enable_thinking)
     else:
         # Setting of Scheduler config will trigger usage of ContinuousBatching pipeline, which is not default for Qwen2VL, Qwen2.5VL, Gemma3 due to accuracy issues.
         scheduler_config = ov_genai.SchedulerConfig()
         scheduler_config.enable_prefix_caching = False
         scheduler_config.max_num_batched_tokens = sys.maxsize
-        pipe = ov_genai.VLMPipeline(models_path, device, scheduler_config=scheduler_config)
+        pipe = ov_genai.VLMPipeline(models_path, device, scheduler_config=scheduler_config, enable_thinking=args.enable_thinking)
 
     input_data = pipe.get_tokenizer().encode(prompt)
     prompt_token_size = input_data.input_ids.get_shape()[1]

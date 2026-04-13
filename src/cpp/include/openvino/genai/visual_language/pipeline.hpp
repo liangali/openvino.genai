@@ -23,6 +23,8 @@ public:
 /// response or run a chat given a prompt and an image.
 class OPENVINO_GENAI_EXPORTS VLMPipeline {
 public:
+    class VLMPipelineBase;
+
     /// @brief Construct a pipeline from a folder containing tokenizer
     /// and model IRs.
     /// @param models_path A folder to read tokenizer and model IRs.
@@ -288,9 +290,21 @@ public:
     void set_generation_config(const GenerationConfig& new_config);
 
 private:
-    class VLMPipelineBase;
     class VLMPipelineImpl;
     class VLMContinuousBatchingAdapter;
+    friend std::unique_ptr<VLMPipelineBase> make_qwen3_5_vl_pipeline(
+        const std::filesystem::path& models_dir,
+        const std::string& device,
+        const ov::AnyMap& properties
+    );
+    friend std::unique_ptr<VLMPipelineBase> make_qwen3_5_vl_pipeline(
+        const ModelsMap& models_map,
+        const Tokenizer& tokenizer,
+        const std::filesystem::path& config_dir_path,
+        const std::string& device,
+        const ov::AnyMap& properties,
+        const GenerationConfig& generation_config
+    );
     std::unique_ptr<VLMPipelineBase> m_pimpl;
 };
 
