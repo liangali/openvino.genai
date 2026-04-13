@@ -17,6 +17,7 @@
 
 #include "visual_language/vision_registry.hpp"
 #include "visual_language/vlm_chat_context.hpp"
+#include "visual_language/qwen3_5_vl/pipeline_impl.inc"
 
 #include "sampling/sampler.hpp"
 #include "utils.hpp"
@@ -604,6 +605,7 @@ bool requires_sdpa(const std::filesystem::path& models_dir) {
     auto vlm_config = utils::from_config_json_if_exists<VLMConfig>(models_dir, "config.json");
     return vlm_config.model_type == VLMModelType::QWEN2_VL ||
            vlm_config.model_type == VLMModelType::QWEN2_5_VL ||
+           vlm_config.model_type == VLMModelType::QWEN3_5_VL ||
            vlm_config.model_type == VLMModelType::GEMMA3;
 }
 
@@ -615,7 +617,10 @@ VLMPipeline::VLMPipeline(
     auto start_time = std::chrono::steady_clock::now();
 
     auto [properties, attention_backend] = utils::extract_attention_backend(user_properties);
-    if (device == "NPU") {
+    auto vlm_config = utils::from_config_json_if_exists<VLMConfig>(models_dir, "config.json");
+    if (vlm_config.model_type == VLMModelType::QWEN3_5_VL) {
+        m_pimpl = make_qwen3_5_vl_pipeline(models_dir, device, properties);
+    } else if (device == "NPU") {
         auto it = properties.find("scheduler_config");
         OPENVINO_ASSERT(it == properties.end(), "scheduler_config should be removed for VLMPipeline initialization");
         m_pimpl = std::make_unique<VLMPipelineImpl>(models_dir, device, properties);
@@ -658,7 +663,10 @@ VLMPipeline::VLMPipeline(
     auto start_time = std::chrono::steady_clock::now();
 
     auto [properties, attention_backend] = utils::extract_attention_backend(user_properties);
-    if (device == "NPU") {
+    auto vlm_config = utils::from_config_json_if_exists<VLMConfig>(config_dir_path, "config.json");
+    if (vlm_config.model_type == VLMModelType::QWEN3_5_VL) {
+        m_pimpl = make_qwen3_5_vl_pipeline(models_map, tokenizer, config_dir_path, device, properties, generation_config);
+    } else if (device == "NPU") {
         auto it = properties.find("scheduler_config");
         OPENVINO_ASSERT(it == properties.end(), "scheduler_config should be removed for VLMPipeline initialization");
         m_pimpl = std::make_unique<VLMPipelineImpl>(models_map, tokenizer, config_dir_path, device, properties, generation_config);

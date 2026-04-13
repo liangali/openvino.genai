@@ -84,7 +84,9 @@ ov::genai::utils::GenerationFinishInfo get_lm_encoded_results(
     utils::KVCacheState& kv_cache_state,
     EmbeddingsModel::Ptr m_embedding,
     std::optional<int64_t> rope_delta,
-    const size_t max_kv_cache_size
+    const size_t max_kv_cache_size,
+    const std::vector<std::pair<std::string, ov::Tensor>>& prompt_extra_inputs,
+    const std::vector<std::pair<std::string, ov::Tensor>>& generation_extra_inputs
 ) {
     std::vector<GenerationHandle> generations;
     for (SequenceGroup::Ptr sequence_group : sequence_groups) {
@@ -144,6 +146,9 @@ ov::genai::utils::GenerationFinishInfo get_lm_encoded_results(
     m_llm.set_tensor("attention_mask", attention_mask);
     if (position_ids.has_value())
         m_llm.set_tensor("position_ids", *position_ids);
+    for (const auto& [tensor_name, tensor] : prompt_extra_inputs) {
+        m_llm.set_tensor(tensor_name, tensor);
+    }
 
     ov::Tensor beam_idx = ov::Tensor(ov::element::i32, {batch_size});
     std::fill_n(beam_idx.data<int32_t>(), batch_size, 0);
@@ -178,6 +183,10 @@ ov::genai::utils::GenerationFinishInfo get_lm_encoded_results(
     raw_perf_counters.m_batch_sizes.emplace_back(sampler_output.num_generated_tokens);
 
     // "Generation" phase
+
+    for (const auto& [tensor_name, tensor] : generation_extra_inputs) {
+        m_llm.set_tensor(tensor_name, tensor);
+    }
 
     while (!active_sequence_groups.empty()) {
         size_t total_num_tokens = 0;
